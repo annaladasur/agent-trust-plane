@@ -1,0 +1,21 @@
+{
+  "agent": "knowledge",
+  "task_id": "example-task",
+  "task": {
+    "repo": "payments"
+  },
+  "tool": {
+    "name": "graph.hybrid_search"
+  },
+  "args": {
+    "repo": "payments",
+    "query": "who owns payments"
+  },
+  "context": {
+    "tainted": true
+  },
+  "approval": {
+    "granted": false
+  },
+  "args_sha256": "4548e569167760b2a406e637672d60f51ac7891595477f91010fc9a22cc07b74"
+}

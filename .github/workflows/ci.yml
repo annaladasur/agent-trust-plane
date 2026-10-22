@@ -1,0 +1,28 @@
+name: Offline reference checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  policy-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned official OPA binary with checksum
+        env:
+          OPA_VERSION: '1.14.1'
+        run: |
+          curl --fail --location --retry 3 -o /tmp/opa_linux_amd64_static "https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}/opa_linux_amd64_static"
+          curl --fail --location --retry 3 -o /tmp/opa.sha256 "https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}/opa_linux_amd64_static.sha256"
+          cd /tmp
+          echo "$(cut -d ' ' -f 1 opa.sha256)  opa_linux_amd64_static" | sha256sum --check
+          chmod +x opa_linux_amd64_static
+          sudo mv opa_linux_amd64_static /usr/local/bin/opa
+      - name: Test policy boundaries and standalone code
+        run: make test
+      - name: Check local examples and source counts
+        run: |
+          make demo
+          make recount
+          python3 scripts/check_package.py

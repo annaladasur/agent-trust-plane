@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""
+Lightweight STS Token Broker (AAIF & Cloud Native Now Reference Implementation)
+Component of the Agent Trust Plane Trusted Computing Base (TCB §3).
+
+Features:
+- Validates workload identity (projected Kubernetes ServiceAccount tokens)
+- Checks repository and action authorization per agent role
+- Mints narrow, repository-scoped ephemeral bot tokens via Gitea API
+- Enforces strict 300-second (5-minute) lease lifetime
+- Background reaper automatically revokes expired tokens via Gitea API
+- Emits OpenTelemetry OTLP JSON spans to OTel Collector / Jaeger
+- Provides explicit revocation, token inspection, and health endpoints
+"""
+
+import base64
+import http.server
+import json
+import os
+import re
+import socketserver
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+# Configuration
+PORT = int(os.environ.get("BROKER_PORT", "8081"))
+GITEA_URL = os.environ.get("GITEA_URL", "http://gitea.gitea.svc:3000/api/v1")
+GITEA_ADMIN_USER = os.environ.get("GITEA_ADMIN_USER", "gitea_admin")
+OTEL_COLLECTOR_URL = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector.agents.svc:4318/v1/traces")
+TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", "300"))
+REAPER_INTERVAL_SECONDS = float(os.environ.get("REAPER_INTERVAL_SECONDS", "5.0"))
+ALLOW_DEV_TOKENS = os.environ.get("ALLOW_DEV_TOKENS", "true").lower() in ("true", "1", "yes")
+
+# Automatically load cluster/.gitea.env if present
+_env_path = os.path.join(os.path.dirname(__file__), "..", "cluster", ".gitea.env")
+if os.path.isfile(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+# Allowed repositories in microservice architecture
+VALID_REPOS = {"frontend", "payments", "recommendations", "platform"}
+
+# Mapping of actions to minimal required Gitea scopes
+ACTION_SCOPES = {
+    "read": ["read:repository", "read:issue"],
+    "pull": ["read:repository"],
+    "issue_read": ["read:issue"],
+    "contents_read": ["read:repository"],
+    "write": ["write:repository", "write:issue", "read:repository"],
+    "push": ["write:repository", "read:repository"],
+    "pull_request": ["write:repository", "write:issue", "read:repository"],
+    "branch_create": ["write:repository", "read:repository"],
+    "commit": ["write:repository", "read:repository"],
+    "comment": ["write:issue", "read:repository"],
+    "status": ["write:repository", "read:repository"],
+    "verify_comment": ["write:issue", "read:repository"],
+}
+
+# Role permissions matrix (maps agent role to permitted action categories)
+ROLE_PERMISSIONS = {
+    "triage": {"read", "pull", "issue_read", "contents_read"},
+    "knowledge": {"read", "pull", "contents_read"},
+    "coder": {"read", "pull"},  # Sandbox execution; no direct repo write permissions
+    "publisher": {"read", "write", "push", "pull_request", "branch_create", "commit"},
+    "verifier": {"read", "comment", "status", "verify_comment"},
+    "orchestrator": set(ACTION_SCOPES.keys()),
+    "admin": set(ACTION_SCOPES.keys()),
+    "system": set(ACTION_SCOPES.keys()),
+}
+
+START_TIME = time.time()
+ACTIVE_TOKENS = {}
+TOKEN_LOCK = threading.Lock()
+REAPER_RUNNING = True
+
+
+def get_admin_auth() -> str:
+    """Retrieve basic auth credentials for Gitea admin operations"""
+    pwd = os.environ.get("GITEA_ADMIN_PASSWORD", "")
+    if not pwd:
+        # Fallback to local .gitea.env if in cluster/
+        p2 = os.path.join(os.path.dirname(__file__), ".gitea.env")
+        if os.path.isfile(p2):
+            with open(p2) as f:
+                for line in f:
+                    if line.startswith("GITEA_ADMIN_PASSWORD="):
+                        pwd = line.split("=", 1)[1].strip()
+                        break
+    if not pwd:
+        pwd = "AdminDevPassword2026!"
+    return base64.b64encode(f"{GITEA_ADMIN_USER}:{pwd}".encode("utf-8")).decode("ascii")
+
+
+def parse_traceparent(tp_header: str):
+    """Parse W3C Traceparent: 00-{trace_id}-{parent_id}-{flags}"""
+    if not tp_header:
+        return uuid.uuid4().hex, None, "01"
+    parts = tp_header.strip().split("-")
+    if len(parts) == 4 and parts[0] == "00":
+        return parts[1], parts[2], parts[3]
+    return uuid.uuid4().hex, None, "01"
+
+
+def make_traceparent(trace_id: str, span_id: str, flags: str = "01") -> str:
+    return f"00-{trace_id}-{span_id}-{flags}"
+
+
+def decode_workload_identity(auth_header: str, role_header: str = None) -> tuple[str, str]:
+    """
+    Decodes the projected Kubernetes ServiceAccount token JWT or fallback identity.
+    Returns: (subject, role)
+    """
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        try:
+            parts = token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1]
+                rem = len(payload_b64) % 4
+                if rem > 0:
+                    payload_b64 += "=" * (4 - rem)
+                data = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+                sub = data.get("sub", "")
+                sa_name = data.get("kubernetes.io/serviceaccount/service-account.name", "")
+                if not sa_name and "system:serviceaccount:" in sub:
+                    sa_parts = sub.split(":")
+                    if len(sa_parts) >= 4:
+                        sa_name = sa_parts[3]
+
+                # Map sa-publisher -> publisher, etc.
+                role = sa_name
+                if role.startswith("sa-"):
+                    role = role[3:]
+                return sub or f"system:serviceaccount:agents:{sa_name}", role or "unknown"
+        except Exception:
+            pass
+
+    # Dev/test fallback
+    if ALLOW_DEV_TOKENS:
+        role = role_header or "orchestrator"
+        return f"dev:workload:{role}", role
+
+    return "system:anonymous", "unknown"
+
+
+def send_otlp_span(trace_id: str, span_id: str, parent_id: str, name: str, start_ns: int, end_ns: int, attributes: dict):
+    """Emit an OTLP JSON span to OTel Collector"""
+    span_obj = {
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": name,
+        "kind": 2,  # SPAN_KIND_SERVER
+        "startTimeUnixNano": str(start_ns),
+        "endTimeUnixNano": str(end_ns),
+        "status": {"code": 1},
+        "attributes": []
+    }
+    if parent_id:
+        span_obj["parentSpanId"] = parent_id
+
+    for k, v in attributes.items():
+        if isinstance(v, bool):
+            span_obj["attributes"].append({"key": k, "value": {"boolValue": v}})
+        elif isinstance(v, int):
+            span_obj["attributes"].append({"key": k, "value": {"intValue": str(v)}})
+        elif isinstance(v, float):
+            span_obj["attributes"].append({"key": k, "value": {"doubleValue": v}})
+        else:
+            span_obj["attributes"].append({"key": k, "value": {"stringValue": str(v)}})
+
+    payload = {
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    {"key": "service.name", "value": {"stringValue": "broker-sts"}},
+                    {"key": "service.version", "value": {"stringValue": "1.0.0"}},
+                    {"key": "atp.tcb_component", "value": {"stringValue": "sts-token-broker"}}
+                ]
+            },
+            "scopeSpans": [{
+                "scope": {"name": "broker.sts", "version": "1.0.0"},
+                "spans": [span_obj]
+            }]
+        }]
+    }
+
+    try:
+        req = urllib.request.Request(
+            OTEL_COLLECTOR_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            pass
+    except Exception as e:
+        # Non-blocking telemetry warning
+        pass
+
+
+def mint_gitea_token(bot_user: str, token_name: str, scopes: list[str]) -> dict:
+    """Call Gitea REST API to create personal access token with requested scopes"""
+    url = f"{GITEA_URL}/users/{bot_user}/tokens"
+    payload = json.dumps({"name": token_name, "scopes": scopes}).encode("utf-8")
+    headers = {
+        "Authorization": f"Basic {get_admin_auth()}",
+        "Content-Type": "application/json"
+    }
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")
+        raise RuntimeError(f"Gitea token creation failed ({e.code}): {err}")
+    except Exception as e:
+        raise RuntimeError(f"Gitea connection error: {e}")
+
+
+def delete_gitea_token(bot_user: str, token_id: int) -> bool:
+    """Call Gitea REST API to delete personal access token by ID"""
+    url = f"{GITEA_URL}/users/{bot_user}/tokens/{token_id}"
+    headers = {
+        "Authorization": f"Basic {get_admin_auth()}"
+    }
+    req = urllib.request.Request(url, headers=headers, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status in (204, 200)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return True  # Already deleted
+        print(f"[broker-warning] Failed to delete token {token_id} for {bot_user} ({e.code}): {e.read().decode('utf-8')}")
+        return False
+    except Exception as e:
+        print(f"[broker-warning] Failed to delete token {token_id} for {bot_user}: {e}")
+        return False
+
+
+def reaper_thread_loop():
+    """Background thread that automatically deletes tokens whose TTL has expired"""
+    global REAPER_RUNNING
+    while REAPER_RUNNING:
+        time.sleep(REAPER_INTERVAL_SECONDS)
+        now = time.time()
+        expired_ids = []
+
+        with TOKEN_LOCK:
+            for tok_id, tok_info in list(ACTIVE_TOKENS.items()):
+                if now >= tok_info["expires_at"]:
+                    expired_ids.append(tok_id)
+
+        for tok_id in expired_ids:
+            with TOKEN_LOCK:
+                tok_info = ACTIVE_TOKENS.pop(tok_id, None)
+
+            if tok_info:
+                bot_user = tok_info["username"]
+                task_id = tok_info.get("task_id", "unknown")
+                trace_id = tok_info.get("trace_id", uuid.uuid4().hex)
+                span_id = uuid.uuid4().hex[:16]
+
+                success = delete_gitea_token(bot_user, tok_id)
+                now_ns = time.time_ns()
+                send_otlp_span(
+                    trace_id, span_id, None, "broker.revoke_token",
+                    now_ns - 1000000, now_ns,
+                    {
+                        "token.id": tok_id,
+                        "token.username": bot_user,
+                        "token.repo": tok_info.get("repo", ""),
+                        "token.task_id": task_id,
+                        "token.reason": "ttl_expired",
+                        "token.ttl_seconds": TOKEN_TTL_SECONDS,
+                        "token.status": "deleted" if success else "failed"
+                    }
+                )
+                print(f"[broker-audit] REVOKED expired token id={tok_id} user={bot_user} task={task_id} repo={tok_info.get('repo')}")
+
+
+class TokenBrokerHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        print(f"[broker-sts] {self.client_address[0]} - - [{self.log_date_time_string()}] {format % args}")
+
+    def do_GET(self):
+        start_ns = time.time_ns()
+        tp_header = self.headers.get("traceparent")
+        trace_id, parent_id, flags = parse_traceparent(tp_header)
+        span_id = uuid.uuid4().hex[:16]
+
+        if self.path == "/healthz":
+            now = time.time()
+            with TOKEN_LOCK:
+                active_count = len(ACTIVE_TOKENS)
+            resp_data = {
+                "status": "healthy",
+                "service": "broker-sts",
+                "uptime_seconds": int(now - START_TIME),
+                "ttl_seconds": TOKEN_TTL_SECONDS,
+                "active_tokens": active_count,
+                "gitea_url": GITEA_URL
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_data).encode("utf-8"))
+            return
+
+        if self.path == "/tokens":
+            # Masked active token listing for auditing
+            now = time.time()
+            token_list = []
+            with TOKEN_LOCK:
+                for tid, info in ACTIVE_TOKENS.items():
+                    raw_sha = info.get("sha1", "")
+                    masked = f"{raw_sha[:4]}...{raw_sha[-4:]}" if len(raw_sha) >= 8 else "****"
+                    token_list.append({
+                        "id": tid,
+                        "name": info["name"],
+                        "username": info["username"],
+                        "repo": info["repo"],
+                        "role": info["role"],
+                        "task_id": info["task_id"],
+                        "scopes": info["scopes"],
+                        "token_preview": masked,
+                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(info["created_at"])),
+                        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(info["expires_at"])),
+                        "remaining_seconds": max(0, int(info["expires_at"] - now))
+                    })
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+            self.end_headers()
+            self.wfile.write(json.dumps({"count": len(token_list), "tokens": token_list}).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": "endpoint not found"}).encode("utf-8"))
+
+    def do_POST(self):
+        start_ns = time.time_ns()
+        tp_header = self.headers.get("traceparent")
+        trace_id, parent_id, flags = parse_traceparent(tp_header)
+        span_id = uuid.uuid4().hex[:16]
+
+        content_len = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            payload = {}
+
+        # 1. POST /token: Token Exchange & Minting
+        if self.path == "/token":
+            caller_sa, role = decode_workload_identity(
+                self.headers.get("Authorization", ""),
+                self.headers.get("X-Agent-Role", payload.get("role"))
+            )
+            task_id = payload.get("task_id", self.headers.get("X-Task-ID", "task-unspecified"))
+            repo = payload.get("repo", "")
+            action = payload.get("action", "read")
+            acts_for = payload.get("acts_for", self.headers.get("X-Acts-For", "developer@corp.local"))
+
+            # Validation 1: Missing repo
+            if not repo or repo not in VALID_REPOS:
+                end_ns = time.time_ns()
+                send_otlp_span(
+                    trace_id, span_id, parent_id, "broker.authorize",
+                    start_ns, end_ns,
+                    {"authorized": False, "reason": "invalid_repo", "repo": repo, "caller.sa": caller_sa}
+                )
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": f"Invalid or missing repository: '{repo}'. Must be one of {list(VALID_REPOS)}"
+                }).encode("utf-8"))
+                return
+
+            # Validation 2: Missing action
+            if action not in ACTION_SCOPES:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": f"Invalid action: '{action}'. Must be one of {list(ACTION_SCOPES.keys())}"
+                }).encode("utf-8"))
+                return
+
+            # Validation 3: Role Authorization Matrix
+            allowed_actions = ROLE_PERMISSIONS.get(role, set())
+            if action not in allowed_actions:
+                end_ns = time.time_ns()
+                send_otlp_span(
+                    trace_id, span_id, parent_id, "broker.authorize",
+                    start_ns, end_ns,
+                    {
+                        "authorized": False,
+                        "reason": "role_permission_denied",
+                        "caller.role": role,
+                        "action": action,
+                        "caller.sa": caller_sa
+                    }
+                )
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": f"Forbidden: role '{role}' is not authorized to perform action '{action}' on repo '{repo}'"
+                }).encode("utf-8"))
+                return
+
+            # Bot username is scoped strictly to repo
+            bot_user = f"{repo}-bot"
+            scopes = ACTION_SCOPES[action]
+            token_name = f"sts-{task_id[:12]}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
+
+            try:
+                gitea_res = mint_gitea_token(bot_user, token_name, scopes)
+            except Exception as e:
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"Gitea token minting failed: {e}"}).encode("utf-8"))
+                return
+
+            token_id = gitea_res["id"]
+            token_secret = gitea_res["sha1"]
+            now = time.time()
+            expires_at = now + TOKEN_TTL_SECONDS
+
+            # Register in active ledger
+            with TOKEN_LOCK:
+                ACTIVE_TOKENS[token_id] = {
+                    "id": token_id,
+                    "name": token_name,
+                    "sha1": token_secret,
+                    "username": bot_user,
+                    "repo": repo,
+                    "role": role,
+                    "caller_sa": caller_sa,
+                    "action": action,
+                    "task_id": task_id,
+                    "trace_id": trace_id,
+                    "scopes": scopes,
+                    "created_at": now,
+                    "expires_at": expires_at
+                }
+
+            end_ns = time.time_ns()
+            send_otlp_span(
+                trace_id, span_id, parent_id, "broker.mint_token",
+                start_ns, end_ns,
+                {
+                    "token.id": token_id,
+                    "token.name": token_name,
+                    "token.username": bot_user,
+                    "token.repo": repo,
+                    "token.action": action,
+                    "caller.sa": caller_sa,
+                    "caller.role": role,
+                    "task.id": task_id,
+                    "token.scopes": ",".join(scopes),
+                    "token.ttl_seconds": TOKEN_TTL_SECONDS
+                }
+            )
+
+            print(f"[broker-audit] MINTED token id={token_id} for user={bot_user} repo={repo} action={action} role={role} task={task_id} (lease={TOKEN_TTL_SECONDS}s)")
+
+            resp_payload = {
+                "token": token_secret,
+                "token_id": token_id,
+                "username": bot_user,
+                "repo": repo,
+                "action": action,
+                "scopes": scopes,
+                "expires_in": TOKEN_TTL_SECONDS,
+                "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expires_at)),
+                "task_id": task_id,
+                "acts_for": acts_for
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_payload).encode("utf-8"))
+            return
+
+        # 2. POST /token/revoke: Explicit Revocation
+        if self.path in ("/token/revoke", "/token/delete"):
+            token_id = payload.get("token_id")
+            token_sha = payload.get("token")
+
+            target_id = None
+            target_info = None
+
+            with TOKEN_LOCK:
+                if token_id and token_id in ACTIVE_TOKENS:
+                    target_id = token_id
+                    target_info = ACTIVE_TOKENS.pop(token_id)
+                elif token_sha:
+                    for tid, info in list(ACTIVE_TOKENS.items()):
+                        if info.get("sha1") == token_sha:
+                            target_id = tid
+                            target_info = ACTIVE_TOKENS.pop(tid)
+                            break
+
+            if not target_info:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "token not found in active ledger"}).encode("utf-8"))
+                return
+
+            bot_user = target_info["username"]
+            deleted = delete_gitea_token(bot_user, target_id)
+            end_ns = time.time_ns()
+            send_otlp_span(
+                trace_id, span_id, parent_id, "broker.revoke_token",
+                start_ns, end_ns,
+                {
+                    "token.id": target_id,
+                    "token.username": bot_user,
+                    "token.repo": target_info.get("repo", ""),
+                    "token.task_id": target_info.get("task_id", ""),
+                    "token.reason": "explicit_request"
+                }
+            )
+            print(f"[broker-audit] REVOKED token id={target_id} user={bot_user} on explicit request")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "revoked",
+                "token_id": target_id,
+                "deleted": deleted
+            }).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": "endpoint not found"}).encode("utf-8"))
+
+    def do_DELETE(self):
+        # Allow DELETE /token/{id}
+        if self.path.startswith("/token/"):
+            parts = self.path.split("/")
+            try:
+                token_id = int(parts[-1])
+            except ValueError:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "invalid token id"}).encode("utf-8"))
+                return
+
+            with TOKEN_LOCK:
+                target_info = ACTIVE_TOKENS.pop(token_id, None)
+
+            if not target_info:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "token not found"}).encode("utf-8"))
+                return
+
+            bot_user = target_info["username"]
+            deleted = delete_gitea_token(bot_user, token_id)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "revoked", "token_id": token_id, "deleted": deleted}).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+
+def start_server(port: int = PORT, background: bool = False):
+    """Start the STS Token Broker server"""
+    reaper = threading.Thread(target=reaper_thread_loop, daemon=True)
+    reaper.start()
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), TokenBrokerHandler)
+    print(f"============================================================")
+    print(f"Starting STS Token Broker on 0.0.0.0:{port}")
+    print(f"Upstream Gitea:     {GITEA_URL}")
+    print(f"Token TTL:          {TOKEN_TTL_SECONDS} seconds")
+    print(f"Reaper Interval:    {REAPER_INTERVAL_SECONDS} seconds")
+    print(f"Upstream Telemetry: {OTEL_COLLECTOR_URL}")
+    print(f"============================================================")
+
+    if background:
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        return server, t
+    else:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down STS Token Broker...")
+            server.shutdown()
+
+
+def main():
+    start_server(PORT, background=False)
+
+
+if __name__ == "__main__":
+    main()

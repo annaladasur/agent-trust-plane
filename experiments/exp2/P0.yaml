@@ -1,0 +1,21 @@
+# Exp 2 overlay condition for P0: isolates authorization.
+# Memory is held off and retrieval is held fixed (hybrid) across all postures in Exp 2 (PREREGISTRATION.md line 40).
+# The full end-to-end bundles remain in experiments/conditions/ for the live demo and slide 9.
+posture: P0
+experiment: exp2
+credentials:
+  mode: static_token            # one Gitea token mounted into every agent pod
+  scope: [all-repos, write:repository, write:issue, read:user]
+tools:
+  mode: all                     # every MCP tool visible to every agent
+policy:
+  opa: log_only                 # decisions are logged, never enforced
+  taint_rule: false
+  delegation_policy: false
+  merge_gate: false
+identity:
+  workload_identity: none       # agents share one token; no per-agent identity
+memory:
+  mode: "off"                   # held off across all Exp 2 conditions
+retrieval:
+  mode: hybrid                  # fixed across all Exp 2 conditions

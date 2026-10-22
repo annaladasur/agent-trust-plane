@@ -1,0 +1,92 @@
+schema_version: '1.0'
+seed: 20261006
+sealed_at: '2026-10-03T19:35:00Z'
+total_scenarios: 20
+held_out_count: 5
+held_out_scenarios:
+- crossrepo-001
+- crossrepo-003
+- exfil-003
+- privilege-002
+- privilege-005
+scenarios:
+- id: exfil-001
+  family: exfil
+  sha256: 3d6261f18982695ce847d2303845f97c89d1bd8ae03db925bf2af0bacd89d810
+  held_out: false
+- id: exfil-002
+  family: exfil
+  sha256: da3f4304203d14fd88d6cd3cd28b1cf2043c9e325a08bd4a24f98ff85197d00b
+  held_out: false
+- id: exfil-003
+  family: exfil
+  sha256: 2658d53d843a9ab092989f4ae9f2f2d981b488c87adb6f75882769d40a37e0e6
+  held_out: true
+- id: exfil-004
+  family: exfil
+  sha256: 4f6759c3e37ee9fa1b8eede65b0b658b583dd60186308367303a6ec06e6e6df5
+  held_out: false
+- id: exfil-005
+  family: exfil
+  sha256: 962d6d60028982c8c6425832359d45f39e09b4efc91f14224078de23ad41ccf4
+  held_out: false
+- id: privilege-001
+  family: privilege
+  sha256: a38ca70c7309c3445813a3495b73e0a35198a539a7285e981199f785c4c26500
+  held_out: false
+- id: privilege-002
+  family: privilege
+  sha256: 38cbf73e8fa1c2f8cde56bdb76862838e8ac39ce40b056a7ad2a5a5f08043682
+  held_out: true
+- id: privilege-003
+  family: privilege
+  sha256: c19384904cc9961c6f133e2d09a424a3831c7d379984b2bc9f0183a37fe58bbd
+  held_out: false
+- id: privilege-004
+  family: privilege
+  sha256: c32bfa8c2cec22fd1488175ad64fad88e0c2922daebb15599c4e2eea73eb5916
+  held_out: false
+- id: privilege-005
+  family: privilege
+  sha256: bcaa1d3f9b42c148445720bdcb2398b2ca1073943cf86f4740fd8d393d3a7da4
+  held_out: true
+- id: dependency-001
+  family: dependency
+  sha256: 550ac10c528065e733941ed0de3ac16b4c34ef512fbac7f1dd048055f4191a2d
+  held_out: false
+- id: dependency-002
+  family: dependency
+  sha256: f3af9b5de70651a8a2ac3128f3899858bb0a32be805e4d2ec9e75658d96da78a
+  held_out: false
+- id: dependency-003
+  family: dependency
+  sha256: 23e2658b0c1271e54f061a34b61380af59ac026eced2df8994a0185eb1389bc5
+  held_out: false
+- id: dependency-004
+  family: dependency
+  sha256: e07d7b8926ff9a8fdb52f06e1ff9ac94e404db69f55daf39e82b3b857cb34052
+  held_out: false
+- id: dependency-005
+  family: dependency
+  sha256: 7fe48e8924ed71c8d549a1f68a92e0134a36a0e8d2384fc368073258936c8705
+  held_out: false
+- id: crossrepo-001
+  family: crossrepo
+  sha256: de2bbe89def190de90c8298c96a9047d5de8d0111b69b3ea8a3ee54ebfe74c35
+  held_out: true
+- id: crossrepo-002
+  family: crossrepo
+  sha256: 19096813c317787c098140345e9f2b82d027cc7abec7f29b7c81be7fde37c584
+  held_out: false
+- id: crossrepo-003
+  family: crossrepo
+  sha256: 4ba057fc6752e5578440e8d4ec11b710dcb2e914b57f7eec630d2ef7d442bb68
+  held_out: true
+- id: crossrepo-004
+  family: crossrepo
+  sha256: aa83967c2b3964ba3d5cef26da4b3be3af8975631f9a2df77232527778e849cb
+  held_out: false
+- id: crossrepo-005
+  family: crossrepo
+  sha256: dd60e8ab778813dff3c7aa3353482ed2affd916352c788448dc4df07d3d0b87d
+  held_out: false

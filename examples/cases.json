@@ -1,0 +1,44 @@
+[
+  {
+    "name": "unapproved tainted write refused",
+    "file": "tainted-write.json",
+    "query": "data.agent.tools.allow",
+    "expected": false
+  },
+  {
+    "name": "approval bound to exact task/tool/arguments",
+    "file": "approved-write.json",
+    "query": "data.agent.tools.allow",
+    "expected": true
+  },
+  {
+    "name": "stale approval refused after arguments change",
+    "file": "stale-approval.json",
+    "query": "data.agent.tools.allow",
+    "expected": false
+  },
+  {
+    "name": "legitimate read still allowed",
+    "file": "legitimate-read.json",
+    "query": "data.agent.tools.allow",
+    "expected": true
+  },
+  {
+    "name": "missing identity/context refused",
+    "file": "missing-context.json",
+    "query": "data.agent.tools.allow",
+    "expected": false
+  },
+  {
+    "name": "memory stays quarantined after untrusted input",
+    "file": "memory-quarantine.json",
+    "query": "data.agent.memory.state",
+    "expected": "quarantined"
+  },
+  {
+    "name": "unverified merge record refused",
+    "file": "merge-refused.json",
+    "query": "data.merge.attestation.allow",
+    "expected": false
+  }
+]

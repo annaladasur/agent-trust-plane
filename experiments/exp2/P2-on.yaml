@@ -1,0 +1,21 @@
+# Exp 2 overlay condition for P2-on: isolates authorization and the taint rule.
+# Memory is held off and retrieval is held fixed (hybrid) across all postures in Exp 2 (PREREGISTRATION.md line 40).
+# The full end-to-end bundles remain in experiments/conditions/ for the live demo and slide 9.
+posture: P2-on
+experiment: exp2
+credentials:
+  mode: broker                  # per-repo bot token minted per call, revoked after 300 s
+  ttl_seconds: 300
+tools:
+  mode: per_agent               # policies/agent/tools.rego: agent_tools
+policy:
+  opa: enforce
+  taint_rule: true              # docs/taint.md; the variable between P2-off and P2-on
+  delegation_policy: true       # policies/agent/delegation.rego
+  merge_gate: true              # policies/merge/attestation.rego
+identity:
+  workload_identity: projected_sa_token
+memory:
+  mode: "off"                   # held off across all Exp 2 conditions
+retrieval:
+  mode: hybrid                  # fixed across all Exp 2 conditions

@@ -1,0 +1,21 @@
+# kind cluster for the agent trust plane.
+# Models run in Ollama on the macOS host (Metal GPU); pods reach them only through agentgateway.
+# Give the Docker VM 16 GB RAM / 6 CPUs; leave the rest of the 64 GB for Ollama.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: atp
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080   # agentgateway (A2A + MCP + model traffic)
+        hostPort: 18080
+      - containerPort: 30686   # Jaeger UI
+        hostPort: 16686
+      - containerPort: 30300   # Grafana
+        hostPort: 3000
+      - containerPort: 30030   # Gitea
+        hostPort: 3030
+  - role: worker
+    labels: {atp.dev/pool: agents}
+  - role: worker
+    labels: {atp.dev/pool: platform}

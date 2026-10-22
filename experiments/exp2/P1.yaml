@@ -1,0 +1,21 @@
+# Exp 2 overlay condition for P1: isolates authorization.
+# Memory is held off and retrieval is held fixed (hybrid) across all postures in Exp 2 (PREREGISTRATION.md line 40).
+# The full end-to-end bundles remain in experiments/conditions/ for the live demo and slide 9.
+posture: P1
+experiment: exp2
+credentials:
+  mode: static_token
+  scope: [task-repo-only, write:repository]
+tools:
+  mode: all
+policy:
+  opa: log_only
+  taint_rule: false
+  delegation_policy: false
+  merge_gate: false
+identity:
+  workload_identity: none       # agents share one token; no per-agent identity
+memory:
+  mode: "off"                   # held off across all Exp 2 conditions
+retrieval:
+  mode: hybrid                  # fixed across all Exp 2 conditions

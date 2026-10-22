@@ -1,0 +1,151 @@
+.PHONY: help up g0 cluster-up cluster-down test-policies test-stats test-broker verify-isolation verify-policy verify-memory verify-merge-gate protect-branches promote analyze run-matrix run-matrix-dry gitea-env gitea-rotate smoke-test-gemma smoke-test-qwen3-coder smoke-test-qwen3.6 deploy-gitea seed-repos scan-cves
+
+CLUSTER_NAME ?= atp
+
+help:
+	@echo "Agent Trust Plane - Automation Targets"
+	@echo "  make up                    - Bring up complete cluster, gateway, broker, specialist agents, and Gitea"
+	@echo "  make g0                    - Run experimental Gate G0 remediation pipeline across 5 agents"
+	@echo "  make cluster-up            - Create kind cluster with cluster/kind.yaml"
+	@echo "  make cluster-down          - Delete kind cluster '$(CLUSTER_NAME)'"
+	@echo "  make test-policies         - Run all OPA policy unit tests (80 tests)"
+	@echo "  make test-stats            - Run statistical module unit tests"
+	@echo "  make test-broker           - Run STS Token Broker unit tests"
+	@echo "  make verify-isolation      - Run Kubernetes NetworkPolicy structural isolation probe"
+	@echo "  make verify-policy         - Run Gateway CEL and OPA extAuthz policy verification probe (M5)"
+	@echo "  make verify-memory         - Run Memory MCP Server and Write Quarantine verification probe (M6)"
+	@echo "  make verify-merge-gate     - Run In-Toto Decision Records and Gitea Merge Gate probe (M7)"
+	@echo "  make protect-branches      - Configure Gitea branch protection on 'main' across all microservices"
+	@echo "  make promote id=<uuid>     - Promote a quarantined memory record to active"
+	@echo "  make analyze               - Recount historical records (no inferential analysis)"
+	@echo "  make gitea-env             - Generate cluster/.gitea.env with fresh passwords"
+	@echo "  make gitea-rotate          - Rotate Gitea passwords on live cluster"
+	@echo "  make smoke-test-gemma      - Run M0 smoke test on gemma4:e4b"
+	@echo "  make smoke-test-qwen3-coder - Run M0 smoke test on qwen3-coder:30b"
+	@echo "  make smoke-test-qwen3.6    - Run M0 smoke test on qwen3.6:27b"
+
+cluster-up:
+	kind create cluster --config cluster/kind.yaml
+
+cluster-down:
+	kind delete cluster --name $(CLUSTER_NAME)
+
+test-policies:
+	opa test policies/ -v
+
+test-stats:
+	python3 -m unittest discover -s tests -v
+
+test-broker:
+	python3 broker/test_broker.py
+
+verify-isolation:
+	python3 cluster/verify_isolation.py
+
+verify-policy:
+	python3 cluster/verify_gateway_policy.py
+
+verify-memory:
+	python3 cluster/verify_memory_plane.py
+
+verify-merge-gate:
+	python3 cluster/verify_merge_gate.py
+
+protect-branches:
+	python3 cluster/configure_branch_protection.py
+
+promote:
+	@if [ -z "$(id)" ]; then echo "Error: id is required (make promote id=<uuid> by=<user>)"; exit 1; fi
+	python3 -c 'import urllib.request, json; req = urllib.request.Request("http://localhost:18080/tools/memory.promote", data=json.dumps({"id": "$(id)", "promoted_by": "$(or $(by),user:admin)"}).encode(), headers={"Content-Type": "application/json"}); resp = urllib.request.urlopen(req); print(resp.read().decode())'
+
+analyze:
+	python3 scripts/recount.py
+
+MODELS ?= qwen3-coder:30b,qwen3.6:27b
+POSTURES ?= P0,P1,P2-off,P2-on
+REGIMES ?= deny-all
+
+run-matrix:
+	python3 experiments/exp2/run_matrix.py --models $(MODELS) --postures $(POSTURES) --regimes $(REGIMES)
+
+run-matrix-dry:
+	python3 experiments/exp2/run_matrix.py --dry-run
+
+gitea-env:
+	bash cluster/gen_gitea_env.sh
+
+gitea-rotate:
+	bash cluster/rotate_gitea_passwords.sh
+
+smoke-test-gemma:
+	python3 experiments/smoke_test.py --model gemma4:e4b
+
+smoke-test-qwen3-coder:
+	python3 experiments/smoke_test.py --model qwen3-coder:30b
+
+smoke-test-qwen3.6:
+	python3 experiments/smoke_test.py --model qwen3.6:27b
+
+deploy-gitea:
+	kubectl apply -f cluster/gitea.yaml
+
+seed-repos:
+	python3 cluster/seed_repos.py
+
+scan-cves:
+	python3 cluster/scan_cves.py
+
+up:
+	@echo "============================================================"
+	@echo "Agent Trust Plane: Bringing up complete reference stack"
+	@echo "============================================================"
+	@kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$" || kind create cluster --config cluster/kind.yaml
+	@echo "Loading images into kind cluster '$(CLUSTER_NAME)'..."
+	@kind load docker-image jaegertracing/all-in-one:1.57.0 otel/opentelemetry-collector:0.95.0 python:3.11-slim --name $(CLUSTER_NAME) 2>/dev/null || true
+	@echo "Deploying Gitea..."
+	@kubectl apply -f cluster/gitea.yaml
+	@kubectl -n gitea rollout status deploy/gitea --timeout=90s
+	@echo "Bootstrapping Gitea credentials and repositories..."
+	@bash cluster/bootstrap_gitea.sh
+	@echo "Seeding 4 synthetic microservices..."
+	@python3 cluster/seed_repos.py
+	@echo "Configuring Gitea branch protection merge gate across all microservices..."
+	@python3 cluster/configure_branch_protection.py
+	@echo "Deploying Jaeger and OpenTelemetry Collector..."
+	@kubectl apply -f cluster/monitoring.yaml
+	@kubectl -n agents rollout status deploy/jaeger --timeout=60s
+	@kubectl -n agents rollout status deploy/otel-collector --timeout=60s
+	@echo "Deploying Lightweight STS Token Broker..."
+	@kubectl apply -f cluster/broker.yaml
+	@kubectl -n agents rollout status deploy/broker --timeout=60s
+	@echo "Deploying OpenPolicyAgent (OPA) Policy Engine..."
+	@kubectl apply -f cluster/opa.yaml
+	@kubectl -n agents rollout status deploy/opa --timeout=60s
+	@echo "Deploying In-Cluster Postgres with pgvector..."
+	@kubectl apply -f cluster/postgres.yaml
+	@kubectl -n agents rollout status deploy/postgres --timeout=90s
+	@echo "Deploying Memory MCP Server..."
+	@kubectl apply -f cluster/memory.yaml
+	@kubectl -n agents rollout status deploy/memory-mcp --timeout=60s
+	@echo "Deploying ATP Python gateway prototype..."
+	@kubectl apply -f cluster/agentgateway.yaml
+	@kubectl -n agents rollout status deploy/agentgateway --timeout=60s
+	@echo "Deploying in-cluster specialist agents (triage, knowledge, coder, publisher, verifier)..."
+	@kubectl apply -f cluster/agents.yaml
+	@for r in triage knowledge coder publisher verifier; do \
+		kubectl -n agents rollout status "deploy/$$r" --timeout=60s; \
+	done
+	@echo "Applying Kubernetes NetworkPolicies for structural isolation..."
+	@kubectl apply -f cluster/networkpolicies.yaml
+	@echo "============================================================"
+	@echo "🎉 Agent Trust Plane Stack is UP and Healthy!"
+	@echo "  - Gitea:        http://localhost:3030"
+	@echo "  - AgentGateway: http://localhost:18080"
+	@echo "  - Jaeger UI:    http://localhost:16686"
+	@echo "============================================================"
+
+MODEL ?= qwen3-coder:30b
+
+g0:
+	@echo "Executing Gate G0 experimental pipeline on model $(MODEL)..."
+	python3 cluster/run_cve_task.py --cve CVE-2023-44487 --repo frontend --model $(MODEL)

@@ -1,0 +1,44 @@
+name: agent-trust-plane relationship model
+model_file: ./model.fga
+tuples:
+  - {user: user:alice, relation: member, object: team:payments}
+  - {user: user:bob, relation: member, object: team:frontend}
+  - {user: team:payments, relation: owner, object: repo:payments}
+  - {user: team:frontend, relation: owner, object: repo:frontend}
+  - {user: team:frontend#member, relation: reader, object: repo:payments}
+  - {user: repo:payments, relation: repo, object: memory_namespace:repo-payments}
+  - {user: repo:frontend, relation: repo, object: memory_namespace:repo-frontend}
+  - {user: repo:payments, relation: repo, object: document:payments-runbook}
+tests:
+  - name: owners write, readers read, nobody crosses repos
+    check:
+      - user: user:alice
+        object: repo:payments
+        assertions: {writer: true, reader: true}
+      - user: user:alice
+        object: repo:frontend
+        assertions: {writer: false, reader: false}
+      - user: user:bob
+        object: repo:payments
+        assertions: {writer: false, reader: true}
+  - name: memory follows the repo it belongs to
+    check:
+      - user: user:alice
+        object: memory_namespace:repo-payments
+        assertions: {reader: true, writer: true}
+      - user: user:alice
+        object: memory_namespace:repo-frontend
+        assertions: {reader: false, writer: false}
+      - user: user:bob
+        object: memory_namespace:repo-payments
+        assertions: {reader: true, writer: false}
+  - name: retrieved documents are filtered by the developer's access
+    check:
+      - user: user:alice
+        object: document:payments-runbook
+        assertions: {reader: true}
+    list_objects:
+      - user: user:alice
+        type: memory_namespace
+        assertions:
+          reader: [memory_namespace:repo-payments]

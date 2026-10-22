@@ -1,0 +1,361 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: coder-network-isolation
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      app: coder
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Ingress to coder allowed ONLY from agentgateway
+  - from:
+    - podSelector:
+        matchLabels:
+          app: agentgateway
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  # 1. DNS resolution via CoreDNS in kube-system
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 2. Mediation gateway only (agentgateway)
+  - to:
+    - podSelector:
+        matchLabels:
+          app: agentgateway
+    ports:
+    - protocol: TCP
+      port: 8080
+  # 3. Distributed telemetry (otel-collector)
+  - to:
+    - podSelector:
+        matchLabels:
+          app: otel-collector
+    ports:
+    - protocol: TCP
+      port: 4318
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: specialist-agents-isolation
+  namespace: agents
+spec:
+  podSelector:
+    matchExpressions:
+    - key: app
+      operator: In
+      values: [triage, knowledge, publisher, verifier]
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Ingress to agents allowed ONLY from agentgateway
+  - from:
+    - podSelector:
+        matchLabels:
+          app: agentgateway
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  # 1. DNS resolution
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 2. AgentGateway
+  - to:
+    - podSelector:
+        matchLabels:
+          app: agentgateway
+    ports:
+    - protocol: TCP
+      port: 8080
+  # 3. STS Token Broker
+  - to:
+    - podSelector:
+        matchLabels:
+          app: broker
+    ports:
+    - protocol: TCP
+      port: 8081
+  # 4. OpenTelemetry Collector
+  - to:
+    - podSelector:
+        matchLabels:
+          app: otel-collector
+    ports:
+    - protocol: TCP
+      port: 4318
+  # 5. Scoped Gitea API for Publisher & Verifier git operations
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gitea
+    ports:
+    - protocol: TCP
+      port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: broker-network-isolation
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      app: broker
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Ingress to broker allowed from agentgateway and agent pods
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8081
+  egress:
+  # 1. DNS resolution
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 2. Gitea API for token revocation / management
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gitea
+    ports:
+    - protocol: TCP
+      port: 3000
+  # 3. OTel Collector
+  - to:
+    - podSelector:
+        matchLabels:
+          app: otel-collector
+    ports:
+    - protocol: TCP
+      port: 4318
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentgateway-network-isolation
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      app: agentgateway
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Agentgateway receives traffic from orchestrator, ingress, and cluster pods
+  - ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  # 1. DNS resolution
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 2. All agent pods on port 8000
+  - to:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8000
+  # 3. Broker on port 8081
+  - to:
+    - podSelector:
+        matchLabels:
+          app: broker
+    ports:
+    - protocol: TCP
+      port: 8081
+  # 4. OTel Collector on port 4318
+  - to:
+    - podSelector:
+        matchLabels:
+          app: otel-collector
+    ports:
+    - protocol: TCP
+      port: 4318
+  # 5. Gitea in gitea namespace
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gitea
+    ports:
+    - protocol: TCP
+      port: 3000
+  # 6. Host model server (Ollama)
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.96.0.0/12
+    ports:
+    - protocol: TCP
+      port: 11434
+  # 7. In-cluster OPA engine on port 8181 (extAuthz)
+  - to:
+    - podSelector:
+        matchLabels:
+          app: opa
+    ports:
+    - protocol: TCP
+      port: 8181
+  # 8. In-cluster Memory MCP Server on port 8082
+  - to:
+    - podSelector:
+        matchLabels:
+          app: memory-mcp
+    ports:
+    - protocol: TCP
+      port: 8082
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: opa-network-isolation
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      app: opa
+  policyTypes:
+  - Ingress
+  ingress:
+  # Ingress to OPA allowed from agentgateway and memory-mcp
+  - from:
+    - podSelector:
+        matchLabels:
+          app: agentgateway
+    - podSelector:
+        matchLabels:
+          app: memory-mcp
+    ports:
+    - protocol: TCP
+      port: 8181
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: memory-mcp-network-isolation
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      app: memory-mcp
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Ingress to memory-mcp allowed ONLY from agentgateway
+  - from:
+    - podSelector:
+        matchLabels:
+          app: agentgateway
+    ports:
+    - protocol: TCP
+      port: 8082
+  egress:
+  # 1. DNS resolution
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # 2. PostgreSQL on port 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  # 3. OTel Collector on port 4318
+  - to:
+    - podSelector:
+        matchLabels:
+          app: otel-collector
+    ports:
+    - protocol: TCP
+      port: 4318
+  # 4. In-cluster OPA engine on port 8181 (write gate)
+  - to:
+    - podSelector:
+        matchLabels:
+          app: opa
+    ports:
+    - protocol: TCP
+      port: 8181
+  # 5. AgentGateway on port 8080 (taint ledger query)
+  - to:
+    - podSelector:
+        matchLabels:
+          app: agentgateway
+    ports:
+    - protocol: TCP
+      port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-network-isolation
+  namespace: agents
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  # Ingress to Postgres allowed ONLY from memory-mcp
+  - from:
+    - podSelector:
+        matchLabels:
+          app: memory-mcp
+    ports:
+    - protocol: TCP
+      port: 5432

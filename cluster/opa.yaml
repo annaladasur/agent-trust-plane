@@ -1,0 +1,603 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-policies
+  namespace: agents
+data:
+  tooltable.rego: |
+    # The tool table: which MCP tools each agent may call, and which of them write.
+    # Shared by the per-call tool policy (agent/tools.rego) and the merge gate
+    # (merge/attestation.rego), so a write is a write in both places. The merge gate never
+    # trusts the effect a decision record claims for a call (Evidence E5, plan task C1).
+    package lib.tooltable
+
+    import rego.v1
+
+    # Which MCP tools each agent may call at posture P2 (AISVS 9.5.1, 9.3.1).
+    agent_tools := {
+        "orchestrator": set(),
+        "triage": {"gitea.get_issue", "gitea.list_issue_comments", "osv.query", "memory.write"},
+        "knowledge": {"graph.cypher_read", "graph.hybrid_search", "gitea.get_file_contents", "memory.search", "memory.write"},
+        "coder": {"sandbox.read_file", "sandbox.write_file", "sandbox.apply_patch"},
+        "verifier": {"gitea.get_commit_status", "gitea.get_file_contents", "memory.write"},
+        "publisher": {"gitea.create_branch", "gitea.push_files", "gitea.create_pull_request", "memory.write"},
+    }
+
+    write_tools := {
+        "sandbox.write_file", "sandbox.apply_patch", "gitea.create_branch",
+        "gitea.push_files", "gitea.create_pull_request", "memory.write",
+    }
+
+    known_tools contains t if {
+        some ts in agent_tools
+        some t in ts
+    }
+
+    # Only tools in this set count as reads. Anything else, including a tool missing from
+    # the table, counts as a write.
+    read_tools := known_tools - write_tools
+
+    # Agent names. An approval given by an agent identity is never a human approval.
+    agent_names := {name | some name, _ in agent_tools}
+  tools.rego: |
+    # Per-call tool policy, evaluated by agentgateway (via ext-authz) before every MCP tool call.
+    # The decision lives outside the agent's runtime (AISVS 1.0 5.2.5, 9.5.3).
+    # Fails closed on missing or unexpected arguments (Evidence E7, plan task C2).
+    package agent.tools
+
+    import rego.v1
+
+    import data.lib.tooltable
+
+    # Which MCP tools each agent may call at posture P2 (AISVS 9.5.1, 9.3.1), and which
+    # tools write. Both live in lib/tooltable.rego, shared with the merge gate.
+    agent_tools := tooltable.agent_tools
+
+    write_tools := tooltable.write_tools
+
+    default allow := false
+
+    allow if {
+        input.tool.name in agent_tools[input.agent]
+        count(deny) == 0
+    }
+
+    effect := "write" if input.tool.name in write_tools
+
+    else := "read"
+
+    # -----------------------------------------------------------------------------
+    # Input & Context Integrity (Fail closed)
+    # -----------------------------------------------------------------------------
+
+    # Every tool call must carry task identity and valid context.
+    has_task_id if non_empty_string(input.task_id)
+
+    deny contains "missing or invalid task_id" if not has_task_id
+
+    has_task_repo if non_empty_string(input.task.repo)
+
+    deny contains "missing or invalid task.repo" if not has_task_repo
+
+    has_valid_tainted_context if is_boolean(input.context.tainted)
+
+    deny contains "missing or invalid context.tainted" if not has_valid_tainted_context
+
+    task_owner := input.task.owner if non_empty_string(input.task.owner)
+    else := "online-boutique"
+
+    # -----------------------------------------------------------------------------
+    # Taint & Approval Enforcement
+    # -----------------------------------------------------------------------------
+
+    # Once untrusted content has entered the task, writes need a human approval bound to
+    # this exact call (AISVS 9.3.5, 9.2.1, 9.2.8). input.context.tainted is computed by the
+    # gateway from the provenance of tool responses in this task (docs/taint.md). The agent
+    # never reports it and cannot clear it.
+    deny contains "write after untrusted input needs approval" if {
+        effect == "write"
+        input.tool.name != "memory.write" # memory writes are gated by provenance instead (memory.rego)
+        input.context.tainted == true
+        not approval_valid
+    }
+
+    approval_valid if {
+        is_object(input.approval)
+        input.approval.granted == true
+        non_empty_string(input.task_id)
+        input.approval.task_id == input.task_id
+        input.approval.tool == input.tool.name
+        non_empty_string(input.args_sha256)
+        input.approval.args_sha256 == input.args_sha256
+    }
+
+    # -----------------------------------------------------------------------------
+    # Repo and Owner Scoping
+    # -----------------------------------------------------------------------------
+
+    gitea_tools := {
+        "gitea.get_issue",
+        "gitea.list_issue_comments",
+        "gitea.get_file_contents",
+        "gitea.get_commit_status",
+        "gitea.create_branch",
+        "gitea.push_files",
+        "gitea.create_pull_request",
+    }
+
+    has_args_repo if non_empty_string(input.args.repo)
+
+    # All Gitea tools require repo in arguments, and it must match the task's repo
+    deny contains "gitea tool requires repo in arguments" if {
+        input.tool.name in gitea_tools
+        not has_args_repo
+    }
+
+    deny contains "tool target is outside the task's repo" if {
+        has_args_repo
+        input.args.repo != input.task.repo
+    }
+
+    # If owner is specified, it must match the authorized task owner
+    deny contains "tool target owner is outside the task's owner" if {
+        non_empty_string(input.args.owner)
+        input.args.owner != task_owner
+    }
+
+    # -----------------------------------------------------------------------------
+    # Per-tool argument schemas & branch safety
+    # -----------------------------------------------------------------------------
+
+    has_create_branch_target if non_empty_string(input.args.branch)
+    has_create_branch_target if non_empty_string(input.args.new_branch_name)
+
+    # For gitea.create_branch, branch can be in args.branch or args.new_branch_name (Gitea API)
+    create_branch_target := input.args.branch if non_empty_string(input.args.branch)
+    else := input.args.new_branch_name if non_empty_string(input.args.new_branch_name)
+
+    deny contains "create_branch requires branch or new_branch_name" if {
+        input.tool.name == "gitea.create_branch"
+        not has_create_branch_target
+    }
+
+    deny contains "agents never write to main" if {
+        input.tool.name == "gitea.create_branch"
+        has_create_branch_target
+        not valid_agent_branch(create_branch_target)
+    }
+
+    has_push_files_target if non_empty_string(input.args.branch)
+    has_push_files_target if non_empty_string(input.args.ref)
+
+    # For gitea.push_files, branch can be in args.branch or args.ref
+    push_files_target := input.args.branch if non_empty_string(input.args.branch)
+    else := input.args.ref if non_empty_string(input.args.ref)
+
+    deny contains "push_files requires branch or ref" if {
+        input.tool.name == "gitea.push_files"
+        not has_push_files_target
+    }
+
+    deny contains "agents never write to main" if {
+        input.tool.name == "gitea.push_files"
+        has_push_files_target
+        not valid_agent_branch(push_files_target)
+    }
+
+    has_args_head if non_empty_string(input.args.head)
+
+    # For gitea.create_pull_request: head and base are required, head must be agent branch
+    deny contains "create_pull_request requires head" if {
+        input.tool.name == "gitea.create_pull_request"
+        not has_args_head
+    }
+
+    has_args_base if non_empty_string(input.args.base)
+
+    deny contains "create_pull_request requires base" if {
+        input.tool.name == "gitea.create_pull_request"
+        not has_args_base
+    }
+
+    deny contains "PR must come from an agent branch" if {
+        input.tool.name == "gitea.create_pull_request"
+        has_args_head
+        not valid_agent_branch(input.args.head)
+    }
+
+    valid_agent_branch(b) if startswith(b, "agent/")
+    valid_agent_branch(b) if startswith(b, "refs/heads/agent/")
+
+    # -----------------------------------------------------------------------------
+    # Credential protection: walk() nested arguments
+    # -----------------------------------------------------------------------------
+
+    # Secrets never travel through tool arguments the model wrote (AISVS 9.5.4).
+    # Recursively scans all nested structures (files[].content, headers, etc.).
+    deny contains "credential-like value in tool arguments" if {
+        some _, v in walk(input.args)
+        is_string(v)
+        regex.match(`(?i)(ghp_|gho_|glpat-|xox[bp]-|-----BEGIN [A-Z ]*PRIVATE KEY|CANARY_TOKEN|sec_canary_[0-9a-fA-F]+)`, v)
+    }
+
+    # -----------------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------------
+
+    non_empty_string(x) if {
+        is_string(x)
+        x != ""
+    }
+  delegation.rego: |
+    # A2A delegation policy, evaluated by agentgateway before a delegation reaches an agent
+    # (OWASP ASI07; AISVS 1.0 9.5.5, 9.2.10). The orchestrator is deterministic code, so in
+    # practice this enforces that nothing else delegates, and that acts-for travels on every hop.
+    # Fails closed on missing or unexpected delegation fields (Evidence E7, plan task C2).
+    package agent.delegation
+
+    import rego.v1
+
+    # The only delegation edges that exist. Specialists never call each other.
+    edges := {
+        "orchestrator": {"triage", "knowledge", "coder", "verifier", "publisher"},
+    }
+
+    # Callee impact, used to apply the highest impact present anywhere in the chain (9.2.10).
+    impact := {"triage": 0, "knowledge": 0, "verifier": 0, "coder": 1, "publisher": 2}
+
+    max_depth := 2
+
+    default allow := false
+
+    allow if {
+        input.callee in edges[input.caller]
+        count(deny) == 0
+    }
+
+    # Delegation chain must be present as a non-empty array (Evidence E7, plan task C2)
+    has_valid_chain if {
+        is_array(input.chain)
+        count(input.chain) > 0
+    }
+
+    deny contains "missing or invalid delegation chain" if not has_valid_chain
+
+    deny contains "delegation chain too deep" if {
+        has_valid_chain
+        count(input.chain) >= max_depth
+    }
+
+    # Context must specify whether the task is tainted
+    has_valid_tainted_context if is_boolean(input.context.tainted)
+
+    deny contains "missing or invalid context.tainted" if not has_valid_tainted_context
+
+    deny contains "delegating a write to publisher after untrusted input needs approval" if {
+        impact[input.callee] == 2
+        input.context.tainted == true
+        not input.approval.granted == true
+    }
+
+    deny contains "acts-for must be carried on every delegation" if not has_acts_for
+
+    has_acts_for if {
+        is_string(input.acts_for)
+        input.acts_for != ""
+    }
+
+    # Signed A2A Agent Cards (JWS, optional in A2A 1.0) are future work; when added, require
+    # input.callee_card.signature_verified here.
+  memory.rego: |
+    # Memory write gate, evaluated by the memory MCP server on every memory.write
+    # (OWASP ASI06; AISVS 1.0 8.2.3, 8.3.3, 12.5.4).
+    # Closes Evidence E6 (Task C3): enforces automatic write quarantine on every memory
+    # written during a tainted task, consuming task taint from the gateway ledger.
+    package agent.memory
+
+    import rego.v1
+
+    # New memories start quarantined unless every source they came from is trusted
+    # AND the task is not tainted. Taint is sticky for the whole task (docs/taint.md).
+    default state := "quarantined"
+
+    state := "active" if {
+        not is_tainted
+        count(input.sources) > 0
+        every s in input.sources {
+            s.trust == "trusted"
+        }
+        input.namespace == sprintf("repo:%s", [input.task.repo])
+    }
+
+    # Task taint is maintained by agentgateway's ledger and passed in input.task.tainted
+    # (or input.context.tainted). If tainted is true, memory writes are quarantined.
+    is_tainted if input.task.tainted == true
+
+    is_tainted if input.context.tainted == true
+
+    # Every write must carry provenance (source, writer identity, timestamp).
+    deny contains "memory write without provenance" if count(input.sources) == 0
+
+    deny contains "memory write without writer identity" if not input.writer.spiffe_id
+
+    deny contains "memory write outside the task's namespace" if {
+        input.namespace != sprintf("repo:%s", [input.task.repo])
+        input.namespace != "org"
+    }
+
+  attestation.rego: |
+    # Merge gate: a required status check on every agent PR. It reads the PR's decision record
+    # (an in-toto Statement signed by the platform) and refuses the merge when the record is
+    # missing or unsigned, or when untrusted context fed a write without a matching approval.
+    # This is what makes the record a control, not only evidence (AISVS 1.0 9.4.2, 12.4.2; AC.8.1).
+    #
+    # It fails closed (Evidence E5, plan task C1, panel finding C3):
+    #   - A call's effect comes from the shared tool table (lib/tooltable.rego), never from the
+    #     record. A tool the table doesn't list as a read counts as a write.
+    #   - An approval counts only when a configured human approver, outside the agent
+    #     identities, granted it for this task, this tool and this exact argument hash.
+    #   - A record without a context list, a tool_calls list, a task_id, the expected
+    #     predicateType or a model digest is refused.
+    #   - Context counts as trusted only when it says "trusted". A missing label is untrusted.
+    #
+    # Configuration: data.atp.approvers is the list of human principals allowed to approve
+    # (for example "user:alice"). It comes from deployment config, never from the record.
+    # With no list configured, no approval is valid.
+    package merge.attestation
+
+    import rego.v1
+
+    import data.lib.tooltable
+
+    statement_type := "https://in-toto.io/Statement/v1"
+
+    predicate_type := "https://atp.local/agent-decision/v0.1"
+
+    default allow := false
+
+    allow if count(deny) == 0
+
+    stmt := input.statement
+
+    pred := input.statement.predicate
+
+    deny contains "no decision record on this PR" if not input.statement
+
+    # Only a boolean true counts. A string or any other truthy value doesn't.
+    deny contains "decision record signature not verified" if not input.signature_verified == true
+
+    deny contains "decision record is not an in-toto Statement v1" if {
+        input.statement
+        not stmt._type == statement_type
+    }
+
+    deny contains "decision record has the wrong predicateType" if {
+        input.statement
+        not stmt.predicateType == predicate_type
+    }
+
+    deny contains "decision record is not for this commit" if {
+        input.statement
+        not subject_matches
+    }
+
+    subject_matches if {
+        non_empty_string(input.pr.head_sha)
+        some s in stmt.subject
+        s.digest.gitCommit == input.pr.head_sha
+    }
+
+    deny contains "decision record has no model digest" if {
+        input.statement
+        not has_model_digest
+    }
+
+    deny contains "decision record has no task_id" if {
+        input.statement
+        not has_task_id
+    }
+
+    # A record that omits its context can't show the context was trusted.
+    deny contains "decision record has no context list" if {
+        input.statement
+        not has_context
+    }
+
+    # An agent PR always comes from at least one tool call; a record without them hides them.
+    deny contains "decision record has no tool_calls list" if {
+        input.statement
+        not has_tool_calls
+    }
+
+    deny contains msg if {
+        some i, call in pred.tool_calls
+        not has_tool_name(call)
+        msg := sprintf("tool call %d has no tool name", [i])
+    }
+
+    # Presence checks are helper rules on purpose. OPA hoists an undefined function argument
+    # out of `not`, so `not f(pred.missing)` is undefined rather than true, and the deny
+    # would silently never fire. Each helper takes no argument or a defined one.
+    has_model_digest if non_empty_string(pred.model.digest)
+
+    has_task_id if non_empty_string(pred.task_id)
+
+    has_context if non_empty_array(pred.context)
+
+    has_tool_calls if non_empty_array(pred.tool_calls)
+
+    has_tool_name(call) if non_empty_string(call.tool)
+
+    untrusted_context if {
+        some c in pred.context
+        not is_trusted_context(c)
+    }
+
+    untrusted_context if {
+        some m in pred.memory_reads
+        not is_trusted_memory_read(m)
+    }
+
+    # Context items count as trusted only if trust == "trusted" AND, for memory reads,
+    # the memory state is "active". A quarantined or non-active memory read is untrusted context
+    # (Plan Task C3; closes E6 memory laundering across tasks).
+    is_trusted_context(c) if {
+        c.trust == "trusted"
+        not is_non_active_memory(c)
+    }
+
+    is_non_active_memory(c) if {
+        non_empty_string(c.state)
+        c.state != "active"
+    }
+
+    is_non_active_memory(c) if {
+        c.type == "memory"
+        not c.state == "active"
+    }
+
+    is_non_active_memory(c) if {
+        is_string(c.ref)
+        startswith(c.ref, "memory")
+        not c.state == "active"
+    }
+
+    is_trusted_memory_read(m) if {
+        m.state == "active"
+        m.trust == "trusted"
+    }
+
+
+    deny contains msg if {
+        untrusted_context
+        some i, call in pred.tool_calls
+        is_write(call)
+        not call.tool == "memory.write" # memory writes are gated by provenance instead (memory.rego)
+        not approved(call)
+        msg := sprintf("write %s (call %d) after untrusted context has no valid approval", [tool_name(call), i])
+    }
+
+    # The record's own "effect" field is ignored.
+    is_read(call) if call.tool in tooltable.read_tools
+
+    is_write(call) if not is_read(call)
+
+    # An approval must be granted by a configured human approver, for this task, this tool
+    # and these exact arguments. This is the same binding tools.rego checks per call.
+    approved(call) if {
+        a := call.approval
+        is_object(a)
+        a.granted == true
+        human_approver(a.by)
+        a.task_id == pred.task_id
+        a.tool == call.tool
+        non_empty_string(call.args_sha256)
+        a.args_sha256 == call.args_sha256
+    }
+
+    approvers := {p | some p in data.atp.approvers}
+
+    human_approver(p) if {
+        non_empty_string(p)
+        p in approvers
+        not agent_identity(p)
+    }
+
+    # Workload and agent identities. Listing one of these as an approver doesn't make it human.
+    agent_identity(p) if startswith(p, "spiffe://")
+
+    agent_identity(p) if startswith(p, "system:serviceaccount:")
+
+    agent_identity(p) if startswith(p, "agent:")
+
+    agent_identity(p) if p in tooltable.agent_names
+
+    agent_identity(p) if {
+        some name in tooltable.agent_names
+        endswith(p, sprintf(":%s", [name]))
+    }
+
+    tool_name(call) := call.tool if non_empty_string(call.tool)
+
+    else := "<unnamed>"
+
+    non_empty_string(x) if {
+        is_string(x)
+        x != ""
+    }
+
+    non_empty_array(x) if {
+        is_array(x)
+        count(x) > 0
+    }
+  data.json: |
+    {
+      "atp": {
+        "approvers": ["user:alice", "user:developer", "user:security-reviewer"]
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opa
+  namespace: agents
+  labels:
+    app: opa
+    atp.dev/component: policy-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opa
+  template:
+    metadata:
+      labels:
+        app: opa
+        atp.dev/component: policy-engine
+    spec:
+      nodeSelector:
+        atp.dev/pool: platform
+      containers:
+        - name: opa
+          image: openpolicyagent/opa:latest
+          args:
+            - "run"
+            - "--server"
+            - "--addr=0.0.0.0:8181"
+            - "--ignore=.*"
+            - "--log-level=info"
+            - "/policies"
+          ports:
+            - containerPort: 8181
+              name: http
+          volumeMounts:
+            - name: policies
+              mountPath: /policies
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: policies
+          configMap:
+            name: opa-policies
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opa
+  namespace: agents
+  labels:
+    app: opa
+spec:
+  selector:
+    app: opa
+  ports:
+    - name: http
+      port: 8181
+      targetPort: 8181

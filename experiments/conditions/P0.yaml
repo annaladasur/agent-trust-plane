@@ -1,0 +1,16 @@
+# P0: how many teams start. One broad token everywhere, every tool for every agent.
+posture: P0
+credentials:
+  mode: static_token            # one Gitea token mounted into every agent pod
+  scope: [all-repos, write:repository, write:issue, read:user]
+tools:
+  mode: all                     # every MCP tool visible to every agent
+policy:
+  opa: log_only                 # decisions are logged, never enforced
+  taint_rule: false
+  delegation_policy: false
+  merge_gate: false
+identity:
+  workload_identity: none     # agents share one token; no per-agent identity
+memory: {mode: naive}
+retrieval: {mode: vector}

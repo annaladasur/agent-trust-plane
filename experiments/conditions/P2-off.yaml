@@ -1,0 +1,17 @@
+# P2-off: identical to P2-on except the taint rule is off. Isolates what the taint rule adds. No mounted tokens; identity per agent;
+# per-agent tools; OPA on every tool call and delegation; merge gate reads the decision record.
+posture: P2-off
+credentials:
+  mode: broker                  # per-repo bot token minted per call, revoked after 300 s
+  ttl_seconds: 300
+tools:
+  mode: per_agent               # policies/agent/tools.rego: agent_tools
+policy:
+  opa: enforce
+  taint_rule: false             # the only difference from P2-on
+  delegation_policy: true       # policies/agent/delegation.rego
+  merge_gate: true              # policies/merge/attestation.rego
+identity:
+  workload_identity: projected_sa_token   # SPIRE SVIDs if time allows (stretch)
+memory: {mode: gated}           # policies/agent/memory.rego
+retrieval: {mode: hybrid}

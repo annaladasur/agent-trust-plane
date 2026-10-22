@@ -1,0 +1,17 @@
+# P2-on: the trust plane with the taint rule on. No mounted tokens; identity per agent;
+# per-agent tools; OPA on every tool call and delegation; merge gate reads the decision record.
+posture: P2-on
+credentials:
+  mode: broker                  # per-repo bot token minted per call, revoked after 300 s
+  ttl_seconds: 300
+tools:
+  mode: per_agent               # policies/agent/tools.rego: agent_tools
+policy:
+  opa: enforce
+  taint_rule: true              # docs/taint.md; the variable between P2-off and P2-on
+  delegation_policy: true       # policies/agent/delegation.rego
+  merge_gate: true              # policies/merge/attestation.rego
+identity:
+  workload_identity: projected_sa_token   # SPIRE SVIDs if time allows (stretch)
+memory: {mode: gated}           # policies/agent/memory.rego
+retrieval: {mode: hybrid}

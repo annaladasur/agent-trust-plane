@@ -1,0 +1,25 @@
+{
+  "agent": "publisher",
+  "task_id": "example-task",
+  "task": {
+    "repo": "payments"
+  },
+  "tool": {
+    "name": "gitea.create_pull_request"
+  },
+  "args": {
+    "repo": "payments",
+    "head": "agent/example-task",
+    "base": "main"
+  },
+  "context": {
+    "tainted": true
+  },
+  "approval": {
+    "granted": true,
+    "task_id": "example-task",
+    "tool": "gitea.create_pull_request",
+    "args_sha256": "4548e569167760b2a406e637672d60f51ac7891595477f91010fc9a22cc07b74"
+  },
+  "args_sha256": "4548e569167760b2a406e637672d60f51ac7891595477f91010fc9a22cc07b74"
+}

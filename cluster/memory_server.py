@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+"""
+Memory MCP Server (Task M6 / Build-Spec §8 / OWASP ASI06 / Review Evidence E6)
+Component of the Agent Trust Plane Trusted Computing Base.
+
+Capabilities:
+1. In-Cluster Postgres + pgvector storage:
+   - Stores memory records with vector embeddings, namespace, provenance, trust level, and state.
+2. Memory Write Gate (policies/agent/memory.rego):
+   - Provenance enforcement: requires non-empty sources and writer identity.
+   - Namespace scoping: writes must match task repo or org namespace.
+   - Sticky task taint: consumes taint from agentgateway ledger (/ledger/taint);
+     quarantines any write during tainted sessions (closing Evidence E6).
+3. Gated Read Isolation & OpenFGA Namespace Filtering (fga/model.fga):
+   - Evaluates caller developer authorization via relationship model.
+   - Blocks cross-namespace reads (e.g. payments developer accessing frontend memories).
+   - In gated mode, strictly filters out 'quarantined' and 'expired' memories.
+4. Memory Lifecycle & Promotion:
+   - Supports explicit promotion (quarantined -> active) with 'promoted_by' audit trail.
+   - Enforces default 14-day TTL and clock-skew expiration.
+5. Distributed Telemetry:
+   - Emits OTLP JSON spans to OTel Collector with atp.memory.* attributes.
+"""
+
+import base64
+import datetime
+import hashlib
+import http.server
+import json
+import os
+import re
+import socket
+import socketserver
+import struct
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+# Configuration
+PORT = int(os.environ.get("MEMORY_PORT", "8082"))
+PG_HOST = os.environ.get("PG_HOST", "postgres.agents.svc")
+PG_PORT = int(os.environ.get("PG_PORT", "5432"))
+PG_USER = os.environ.get("PG_USER", "atp_admin")
+PG_DB = os.environ.get("PG_DB", "atp_memory")
+PG_PASSWORD = os.environ.get("PG_PASSWORD", "atp_memory_secure_pass_2026")
+
+OPA_URL = os.environ.get("OPA_URL", "http://opa.agents.svc:8181")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://agentgateway.agents.svc:8080")
+OTEL_COLLECTOR_URL = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector.agents.svc:4318/v1/traces")
+
+DEFAULT_TTL_DAYS = 14
+
+# -----------------------------------------------------------------------------
+# Pure-Python PostgreSQL v3.0 Wire Protocol Client
+# -----------------------------------------------------------------------------
+
+class PgError(Exception):
+    pass
+
+class PgClient:
+    """Lightweight, zero-dependency PostgreSQL v3.0 wire protocol client."""
+    def __init__(self, host=PG_HOST, port=PG_PORT, user=PG_USER, db=PG_DB, password=PG_PASSWORD):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.db = db
+        self.password = password
+        self._lock = threading.Lock()
+
+    def _connect(self) -> socket.socket:
+        s = socket.create_connection((self.host, self.port), timeout=10)
+        # StartupMessage: protocol 3.0 (0x00030000)
+        body = (
+            b"\x00\x03\x00\x00"
+            + b"user\x00" + self.user.encode("utf-8") + b"\x00"
+            + b"database\x00" + self.db.encode("utf-8") + b"\x00"
+            + b"client_encoding\x00UTF8\x00\x00"
+        )
+        msg = struct.pack("!I", len(body) + 4) + body
+        s.sendall(msg)
+
+        while True:
+            t = self._recv_exact(s, 1)
+            l_bytes = self._recv_exact(s, 4)
+            length = struct.unpack("!I", l_bytes)[0]
+            payload = self._recv_exact(s, length - 4) if length > 4 else b""
+
+            if t == b"R":
+                code = struct.unpack("!I", payload[:4])[0]
+                if code == 0:
+                    pass  # Auth OK
+                elif code == 3:
+                    # Cleartext password
+                    pw_b = self.password.encode("utf-8") + b"\x00"
+                    s.sendall(b"p" + struct.pack("!I", len(pw_b) + 4) + pw_b)
+                elif code == 5:
+                    salt = payload[4:8]
+                    # MD5 authentication: md5(md5(password + user) + salt)
+                    inner = hashlib.md5(self.password.encode("utf-8") + self.user.encode("utf-8")).hexdigest()
+                    outer = "md5" + hashlib.md5(inner.encode("utf-8") + salt).hexdigest()
+                    pw_b = outer.encode("utf-8") + b"\x00"
+                    s.sendall(b"p" + struct.pack("!I", len(pw_b) + 4) + pw_b)
+                else:
+                    raise PgError(f"Unsupported authentication request code: {code}")
+            elif t == b"E":
+                err = self._parse_error(payload)
+                raise PgError(f"Postgres connection error: {err}")
+            elif t == b"Z":
+                break  # Ready for query
+        return s
+
+    def _recv_exact(self, s: socket.socket, num_bytes: int) -> bytes:
+        data = b""
+        while len(data) < num_bytes:
+            chunk = s.recv(num_bytes - len(data))
+            if not chunk:
+                raise PgError("Socket closed prematurely")
+            data += chunk
+        return data
+
+    def _parse_error(self, payload: bytes) -> str:
+        parts = []
+        idx = 0
+        while idx < len(payload):
+            f_type = payload[idx:idx+1]
+            if f_type == b"\x00":
+                break
+            idx += 1
+            null_pos = payload.find(b"\x00", idx)
+            if null_pos != -1:
+                val = payload[idx:null_pos].decode("utf-8", errors="replace")
+                parts.append(val)
+                idx = null_pos + 1
+            else:
+                break
+        return " | ".join(parts)
+
+    def query(self, sql: str) -> list[dict]:
+        with self._lock:
+            s = self._connect()
+            try:
+                q_bytes = sql.encode("utf-8") + b"\x00"
+                s.sendall(b"Q" + struct.pack("!I", len(q_bytes) + 4) + q_bytes)
+
+                col_names = []
+                rows = []
+                last_error = None
+
+                while True:
+                    t = self._recv_exact(s, 1)
+                    l_bytes = self._recv_exact(s, 4)
+                    length = struct.unpack("!I", l_bytes)[0]
+                    payload = self._recv_exact(s, length - 4) if length > 4 else b""
+
+                    if t == b"T":
+                        # RowDescription
+                        num_fields = struct.unpack("!H", payload[:2])[0]
+                        idx = 2
+                        col_names = []
+                        for _ in range(num_fields):
+                            null_pos = payload.find(b"\x00", idx)
+                            name = payload[idx:null_pos].decode("utf-8", errors="replace")
+                            col_names.append(name)
+                            idx = null_pos + 1 + 18
+                    elif t == b"D":
+                        # DataRow
+                        num_cols = struct.unpack("!H", payload[:2])[0]
+                        idx = 2
+                        row_dict = {}
+                        for i in range(num_cols):
+                            col_len = struct.unpack("!i", payload[idx:idx+4])[0]
+                            idx += 4
+                            col_name = col_names[i] if i < len(col_names) else f"col_{i}"
+                            if col_len == -1:
+                                row_dict[col_name] = None
+                            else:
+                                val_bytes = payload[idx:idx+col_len]
+                                idx += col_len
+                                row_dict[col_name] = val_bytes.decode("utf-8", errors="replace")
+                        rows.append(row_dict)
+                    elif t == b"E":
+                        last_error = self._parse_error(payload)
+                    elif t == b"Z":
+                        break
+
+                if last_error:
+                    raise PgError(f"Query error: {last_error}")
+                return rows
+            finally:
+                try:
+                    s.sendall(b"X\x00\x00\x00\x04")  # Terminate
+                    s.close()
+                except Exception:
+                    pass
+
+def pg_quote(val) -> str:
+    """Safe SQL literal formatting"""
+    if val is None:
+        return "NULL"
+    if isinstance(val, bool):
+        return "TRUE" if val else "FALSE"
+    if isinstance(val, (int, float)):
+        return str(val)
+    s = str(val)
+    # Double-up single quotes
+    return "'" + s.replace("'", "''") + "'"
+
+# Initialize client
+DB = PgClient()
+
+# -----------------------------------------------------------------------------
+# OpenFGA Relationship Model Resolver (fga/model.fga)
+# -----------------------------------------------------------------------------
+
+# Canonical relationship tuples matching fga/model_test.fga.yaml
+OPENFGA_TUPLES = [
+    {"user": "user:alice", "relation": "member", "object": "team:payments"},
+    {"user": "user:bob", "relation": "member", "object": "team:frontend"},
+    {"user": "team:payments", "relation": "owner", "object": "repo:payments"},
+    {"user": "team:frontend", "relation": "owner", "object": "repo:frontend"},
+    {"user": "team:frontend#member", "relation": "reader", "object": "repo:payments"},
+    {"user": "repo:payments", "relation": "repo", "object": "memory_namespace:repo-payments"},
+    {"user": "repo:frontend", "relation": "repo", "object": "memory_namespace:repo-frontend"},
+    {"user": "repo:payments", "relation": "repo", "object": "memory_namespace:repo:payments"},
+    {"user": "repo:frontend", "relation": "repo", "object": "memory_namespace:repo:frontend"},
+]
+
+def check_openfga(user: str, relation: str, object_type: str, object_id: str) -> bool:
+    """
+    Evaluates relationship model in fga/model.fga:
+    type repo:
+      define owner: [team]
+      define writer: [user, team#member] or member from owner
+      define reader: [user, team#member] or writer
+    type memory_namespace:
+      define reader: reader from repo
+      define writer: writer from repo
+    """
+    if not user:
+        return False
+
+    # Normalize namespace format (repo:payments or repo-payments)
+    clean_id = object_id.replace("memory_namespace:", "")
+    repo_name = clean_id.replace("repo-", "").replace("repo:", "")
+
+    # Org-wide namespace is accessible to all recognized org members
+    if repo_name == "org":
+        return user in ("user:alice", "user:bob", "user:admin")
+
+    # Find teams user belongs to
+    user_teams = [t["object"] for t in OPENFGA_TUPLES if t["user"] == user and t["relation"] == "member"]
+
+    # Direct or team repo permissions
+    target_repo = f"repo:{repo_name}"
+
+    for t in OPENFGA_TUPLES:
+        if t["object"] == target_repo:
+            # Owner relation
+            if t["relation"] == "owner" and t["user"] in user_teams:
+                return True
+            # Direct reader relation
+            if relation == "reader":
+                if t["relation"] == "reader" and (t["user"] == user or any(f"{team}#member" == t["user"] for team in user_teams)):
+                    return True
+
+    return False
+
+# -----------------------------------------------------------------------------
+# Gateway Ledger & OPA Client
+# -----------------------------------------------------------------------------
+
+def get_task_taint_from_ledger(task_id: str) -> tuple[bool, str]:
+    """Retrieve sticky task taint from agentgateway ledger (/ledger/taint)"""
+    if not task_id:
+        return False, "no_task"
+    url = f"{GATEWAY_URL}/ledger/taint?task_id={task_id}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return bool(data.get("tainted", False)), data.get("reason", "")
+    except Exception as e:
+        print(f"[memory-mcp] warning: failed to query gateway ledger for taint: {e}")
+        return False, "ledger_unreachable"
+
+def evaluate_opa_memory_policy(input_data: dict) -> tuple[bool, list[str], str]:
+    """
+    Evaluates policies/agent/memory.rego via OPA REST API.
+    Returns: (is_allowed, deny_reasons, state)
+    """
+    url = f"{OPA_URL}/v1/data/agent/memory"
+    payload = json.dumps({"input": input_data}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            result = body.get("result", {})
+            deny = list(result.get("deny", []))
+            state = result.get("state", "quarantined")
+            return len(deny) == 0, deny, state
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")
+        return False, [f"OPA HTTP {e.code}: {err}"], "quarantined"
+    except Exception as e:
+        return False, [f"OPA unreachable: {e}"], "quarantined"
+
+# -----------------------------------------------------------------------------
+# Telemetry
+# -----------------------------------------------------------------------------
+
+def send_otlp_span(trace_id: str, span_id: str, parent_id: str, name: str, start_ns: int, end_ns: int, attributes: dict):
+    """Export OTel span to collector"""
+    span_obj = {
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": name,
+        "kind": 1,
+        "startTimeUnixNano": str(start_ns),
+        "endTimeUnixNano": str(end_ns),
+        "attributes": []
+    }
+    if parent_id:
+        span_obj["parentSpanId"] = parent_id
+
+    for k, v in attributes.items():
+        if isinstance(v, bool):
+            span_obj["attributes"].append({"key": k, "value": {"boolValue": v}})
+        elif isinstance(v, int):
+            span_obj["attributes"].append({"key": k, "value": {"intValue": str(v)}})
+        else:
+            span_obj["attributes"].append({"key": k, "value": {"stringValue": str(v)}})
+
+    payload = {
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    {"key": "service.name", "value": {"stringValue": "memory-mcp"}},
+                    {"key": "service.version", "value": {"stringValue": "1.0.0"}}
+                ]
+            },
+            "scopeSpans": [{
+                "scope": {"name": "memory.mcp", "version": "1.0.0"},
+                "spans": [span_obj]
+            }]
+        }]
+    }
+
+    try:
+        req = urllib.request.Request(
+            OTEL_COLLECTOR_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            pass
+    except Exception as e:
+        pass
+
+# -----------------------------------------------------------------------------
+# HTTP Request Handler
+# -----------------------------------------------------------------------------
+
+class MemoryHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "MemoryMCP/1.0.0"
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            # Verify DB connection
+            try:
+                DB.query("SELECT 1;")
+                db_healthy = True
+            except Exception as e:
+                db_healthy = False
+            self.send_response(200 if db_healthy else 500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "healthy" if db_healthy else "unhealthy",
+                "service": "memory-mcp",
+                "database": "connected" if db_healthy else "error"
+            }).encode("utf-8"))
+            return
+
+        if self.path == "/memories" or self.path.startswith("/memories?"):
+            try:
+                rows = DB.query("SELECT id, namespace, content, source_ref, source_trust, task_id, writer, acts_for, state, created_at, expires_at, promoted_by FROM memory ORDER BY created_at DESC;")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"total": len(rows), "memories": rows}, indent=2).encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"Database query failed: {e}"}).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        start_ns = time.time_ns()
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            payload = {}
+
+        traceparent = self.headers.get("traceparent", "")
+        parts = traceparent.split("-") if traceparent else []
+        trace_id = parts[1] if len(parts) == 4 else uuid.uuid4().hex
+        parent_id = parts[2] if len(parts) == 4 else None
+        span_id = uuid.uuid4().hex[:16]
+
+        path = self.path
+        if path.startswith("/tools/"):
+            action = path[len("/tools/"):]
+        else:
+            action = path.lstrip("/")
+
+        # 1. memory.write (Build-Spec §8 / Evidence E6)
+        if action in ("memory.write", "write"):
+            self.handle_memory_write(payload, trace_id, span_id, parent_id, start_ns)
+            return
+
+        # 2. memory.search / memory.read
+        if action in ("memory.search", "memory.read", "search", "read"):
+            self.handle_memory_search(payload, trace_id, span_id, parent_id, start_ns)
+            return
+
+        # 3. memory.promote
+        if action in ("memory.promote", "promote"):
+            self.handle_memory_promote(payload, trace_id, span_id, parent_id, start_ns)
+            return
+
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": f"Unknown tool action: {action}"}).encode("utf-8"))
+
+    def handle_memory_write(self, payload: dict, trace_id: str, span_id: str, parent_id: str, start_ns: int):
+        args = payload.get("args", payload)
+        namespace = args.get("namespace", payload.get("namespace", ""))
+        content = args.get("content", payload.get("content", ""))
+        source_ref = args.get("source_ref", payload.get("source_ref", ""))
+        source_trust = args.get("source_trust", payload.get("source_trust", "trusted"))
+        task_id = args.get("task_id", payload.get("task_id", self.headers.get("X-Task-ID", "")))
+        acts_for = args.get("acts_for", payload.get("acts_for", "user:alice"))
+
+        # Normalize sources
+        sources = args.get("sources", payload.get("sources", []))
+        if not sources and source_ref:
+            sources = [{"ref": source_ref, "trust": source_trust}]
+
+        # Writer identity
+        writer = args.get("writer", payload.get("writer", {}))
+        if isinstance(writer, str):
+            writer_spiffe = writer
+            writer_obj = {"spiffe_id": writer}
+        elif isinstance(writer, dict):
+            writer_spiffe = writer.get("spiffe_id", "")
+            writer_obj = writer
+        else:
+            writer_spiffe = self.headers.get("X-Agent-Role", "spiffe://atp.local/ns/agents/sa/unknown")
+            writer_obj = {"spiffe_id": writer_spiffe}
+
+        # Task repository
+        repo = args.get("repo", payload.get("repo", ""))
+        if not repo and namespace.startswith("repo:"):
+            repo = namespace.split("repo:", 1)[1]
+
+        # 1. Fetch Task Taint from gateway ledger or payload
+        task_tainted = False
+        if payload.get("context", {}).get("tainted") is True or args.get("context", {}).get("tainted") is True:
+            task_tainted = True
+        elif payload.get("task", {}).get("tainted") is True or args.get("task", {}).get("tainted") is True:
+            task_tainted = True
+        else:
+            ledger_tainted, taint_reason = get_task_taint_from_ledger(task_id)
+            if ledger_tainted:
+                task_tainted = True
+
+        # 2. Evaluate OPA Write Gate (policies/agent/memory.rego)
+        opa_input = {
+            "namespace": namespace,
+            "task": {
+                "id": task_id,
+                "repo": repo,
+                "tainted": task_tainted
+            },
+            "context": {
+                "tainted": task_tainted
+            },
+            "writer": writer_obj,
+            "sources": sources,
+            "content": content
+        }
+
+        allowed, deny_reasons, state = evaluate_opa_memory_policy(opa_input)
+
+        if not allowed:
+            # Policy deny (missing provenance, missing writer identity, or foreign namespace)
+            send_otlp_span(trace_id, span_id, parent_id, "memory.write_denied", start_ns, time.time_ns(), {
+                "atp.task_id": task_id, "atp.policy.result": "deny", "atp.policy.reasons": json.dumps(deny_reasons)
+            })
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "error": "Memory write denied by policy",
+                "rule": "agent.memory",
+                "deny": deny_reasons
+            }).encode("utf-8"))
+            return
+
+        # 3. Calculate expiration
+        custom_expires = args.get("expires_at", payload.get("expires_at"))
+        ttl_days = int(args.get("ttl_days", payload.get("ttl_days", DEFAULT_TTL_DAYS)))
+        if custom_expires:
+            expires_at_sql = f"'{custom_expires}'::timestamptz"
+        else:
+            expires_at_sql = f"now() + interval '{ttl_days} days'"
+
+        # 4. Insert into Postgres
+        mem_id = str(uuid.uuid4())
+        ref_to_store = sources[0]["ref"] if sources else source_ref
+        trust_to_store = sources[0]["trust"] if sources else source_trust
+
+        sql = f"""
+        INSERT INTO memory (id, namespace, content, source_ref, source_trust, task_id, writer, acts_for, state, expires_at)
+        VALUES (
+            {pg_quote(mem_id)}::uuid,
+            {pg_quote(namespace)},
+            {pg_quote(content)},
+            {pg_quote(ref_to_store)},
+            {pg_quote(trust_to_store)},
+            {pg_quote(task_id)},
+            {pg_quote(writer_spiffe)},
+            {pg_quote(acts_for)},
+            {pg_quote(state)},
+            {expires_at_sql}
+        )
+        RETURNING id, namespace, state, created_at, expires_at;
+        """
+
+        try:
+            res = DB.query(sql)
+            created_row = res[0] if res else {}
+            end_ns = time.time_ns()
+
+            send_otlp_span(trace_id, span_id, parent_id, "memory.write", start_ns, end_ns, {
+                "atp.memory.id": mem_id,
+                "atp.memory.state": state,
+                "atp.task_id": task_id,
+                "atp.agent": writer_spiffe,
+                "atp.acts_for": acts_for,
+                "atp.context.tainted": task_tainted,
+                "atp.policy.result": "allow"
+            })
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "memory_id": mem_id,
+                "state": state,
+                "namespace": namespace,
+                "source_ref": ref_to_store,
+                "source_trust": trust_to_store,
+                "task_id": task_id,
+                "tainted": task_tainted,
+                "created_at": created_row.get("created_at"),
+                "expires_at": created_row.get("expires_at")
+            }).encode("utf-8"))
+        except Exception as e:
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"Database insertion failed: {e}"}).encode("utf-8"))
+
+    def handle_memory_search(self, payload: dict, trace_id: str, span_id: str, parent_id: str, start_ns: int):
+        args = payload.get("args", payload)
+        namespace = args.get("namespace", payload.get("namespace", "repo:payments"))
+        query_text = args.get("query", payload.get("query", ""))
+        acts_for = args.get("acts_for", payload.get("acts_for", "user:alice"))
+        mode = args.get("mode", payload.get("mode", "gated")).lower()  # "gated" or "naive"
+        task_id = args.get("task_id", payload.get("task_id", ""))
+        current_time = args.get("current_time", payload.get("current_time"))
+
+        # 1. OpenFGA Relationship Check
+        if not check_openfga(acts_for, "reader", "memory_namespace", namespace):
+            send_otlp_span(trace_id, span_id, parent_id, "memory.search_denied", start_ns, time.time_ns(), {
+                "atp.acts_for": acts_for, "atp.policy.result": "deny", "atp.policy.engine": "openfga"
+            })
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "error": "OpenFGA access denied: unauthorized for namespace",
+                "user": acts_for,
+                "namespace": namespace
+            }).encode("utf-8"))
+            return
+
+        # 2. Build Database Query
+        where_clauses = [f"namespace = {pg_quote(namespace)}"]
+
+        if mode == "gated":
+            # Gated mode: only active records, not expired
+            where_clauses.append("state = 'active'")
+            if current_time:
+                where_clauses.append(f"expires_at > {pg_quote(current_time)}::timestamptz")
+            else:
+                where_clauses.append("expires_at > now()")
+
+        if query_text:
+            escaped_q = query_text.replace("'", "''")
+            where_clauses.append(f"content ILIKE '%{escaped_q}%'")
+
+        where_sql = " AND ".join(where_clauses)
+        sql = f"SELECT id, namespace, content, source_ref, source_trust, task_id, writer, acts_for, state, created_at, expires_at, promoted_by FROM memory WHERE {where_sql} ORDER BY created_at DESC;"
+
+        try:
+            rows = DB.query(sql)
+            # Render memories as markdown quoted blocks with source_ref and trust (Build-Spec §8)
+            rendered_items = []
+            for r in rows:
+                rendered = f"> [source: {r.get('source_ref')} | trust: {r.get('source_trust')}]\n> {r.get('content')}"
+                item = dict(r)
+                item["rendered"] = rendered
+                rendered_items.append(item)
+
+            end_ns = time.time_ns()
+            send_otlp_span(trace_id, span_id, parent_id, "memory.search", start_ns, end_ns, {
+                "atp.acts_for": acts_for,
+                "atp.namespace": namespace,
+                "atp.mode": mode,
+                "atp.result.count": len(rendered_items)
+            })
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "namespace": namespace,
+                "mode": mode,
+                "acts_for": acts_for,
+                "count": len(rendered_items),
+                "memories": rendered_items
+            }).encode("utf-8"))
+        except Exception as e:
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"Database search failed: {e}"}).encode("utf-8"))
+
+    def handle_memory_promote(self, payload: dict, trace_id: str, span_id: str, parent_id: str, start_ns: int):
+        args = payload.get("args", payload)
+        memory_id = args.get("id", payload.get("id", ""))
+        promoted_by = args.get("promoted_by", payload.get("promoted_by", "user:admin"))
+
+        if not memory_id:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Missing memory id"}).encode("utf-8"))
+            return
+
+        sql = f"""
+        UPDATE memory
+        SET state = 'active', promoted_by = {pg_quote(promoted_by)}
+        WHERE id = {pg_quote(memory_id)}::uuid
+        RETURNING id, namespace, state, promoted_by;
+        """
+
+        try:
+            rows = DB.query(sql)
+            if not rows:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"Memory {memory_id} not found"}).encode("utf-8"))
+                return
+
+            row = rows[0]
+            end_ns = time.time_ns()
+            send_otlp_span(trace_id, span_id, parent_id, "memory.promote", start_ns, end_ns, {
+                "atp.memory.id": memory_id,
+                "atp.memory.state": "active",
+                "atp.promoted_by": promoted_by
+            })
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "memory_id": row.get("id"),
+                "state": row.get("state"),
+                "promoted_by": row.get("promoted_by")
+            }).encode("utf-8"))
+        except Exception as e:
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"Database promotion failed: {e}"}).encode("utf-8"))
+
+def run():
+    server_address = ("0.0.0.0", PORT)
+    httpd = socketserver.ThreadingTCPServer(server_address, MemoryHandler)
+    httpd.allow_reuse_address = True
+    print(f"============================================================")
+    print(f"Memory MCP Server listening on 0.0.0.0:{PORT}")
+    print(f"PostgreSQL upstream: {PG_HOST}:{PG_PORT} (DB: {PG_DB})")
+    print(f"OPA upstream:        {OPA_URL}")
+    print(f"Gateway upstream:    {GATEWAY_URL}")
+    print(f"Telemetry upstream:  {OTEL_COLLECTOR_URL}")
+    print(f"============================================================")
+    httpd.serve_forever()
+
+if __name__ == "__main__":
+    run()

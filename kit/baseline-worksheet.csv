@@ -1,0 +1,15 @@
+metric_id,metric,unit,definition,source,baseline_date,baseline_value,baseline_n,target_value,current_value,status,notes
+M1,Standing credentials held by agents,count,Long-lived tokens/keys/app installs usable by any agent,Credential inventory,,,,,,,
+M2,Agent tool calls observed,%,Share of agent tool calls passing through the gateway,Gateway vs agent logs,,,,,,,
+M3,Unsafe-action rate,%,Share of attack-suite scenarios whose canary fires,Attack suite (sandbox),,,,,,,report n and 95% interval
+M4,Poisoned-memory action rate,%,Share of later tasks acting on a planted memory,Memory scenarios,,,,,,,
+M5,Policy coverage,%,Share of agent tool calls with a policy decision from outside the model,Gateway/PDP logs,,,,,,,
+M6,Legitimate task success,%,Share of real agent tasks ending in an accepted change,Task log / PR outcomes,,,,,,,
+M7a,Approvals per task,mean,Human approvals per agent task,Approval log,,,,,,,
+M7b,Tasks untainted,%,Share of tasks that never touched untrusted content,Taint ledger,,,,,,,
+M8,Policy false-positive rate,%,Share of (would-)denies overturned on review,Weekly review sample,,,,,,,
+M9,Record coverage,%,Share of agent PRs with a verified decision record,Merge-gate results,,,,,,,
+M10,Time to explain an agent action,minutes (median),Time to answer why the agent did X,Periodic sample,,,,,,,
+M11,Control overhead,ms (p95),Added latency per tool call,Gateway spans,,,,,,,
+M12,Exception hygiene,%,Share of exceptions closed or renewed on time,Ticketing,,,,,,,
+M13,Control failure rate,%,Share of nightly replays where a blocked scenario succeeds,Nightly suite,,,,,,,

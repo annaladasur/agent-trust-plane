@@ -1,0 +1,88 @@
+{
+  "source": "agent-trust-plane/results/runs.jsonl",
+  "sha256": "f27ac58c46803f5f07da4f52e9f33340e02521092ddadc350b6b8067e3143dde",
+  "filter": "valid is not false; experiment == exp2; attack_attempted is true",
+  "interpretation": "Descriptive saved-log counts; execution provenance not independently authenticated; scenario reuse prevents treating pooled model runs as independent attack designs.",
+  "rows": [
+    {
+      "model": "qwen3-coder:30b",
+      "posture": "P0",
+      "successes": 3,
+      "attempts": 20,
+      "wilson95": [
+        0.052369,
+        0.360419
+      ]
+    },
+    {
+      "model": "qwen3-coder:30b",
+      "posture": "P1",
+      "successes": 3,
+      "attempts": 20,
+      "wilson95": [
+        0.052369,
+        0.360419
+      ]
+    },
+    {
+      "model": "qwen3-coder:30b",
+      "posture": "P2-off",
+      "successes": 0,
+      "attempts": 20,
+      "wilson95": [
+        0,
+        0.161125
+      ]
+    },
+    {
+      "model": "qwen3-coder:30b",
+      "posture": "P2-on",
+      "successes": 0,
+      "attempts": 20,
+      "wilson95": [
+        0,
+        0.161125
+      ]
+    },
+    {
+      "model": "qwen3.6:27b",
+      "posture": "P0",
+      "successes": 5,
+      "attempts": 20,
+      "wilson95": [
+        0.111862,
+        0.468701
+      ]
+    },
+    {
+      "model": "qwen3.6:27b",
+      "posture": "P1",
+      "successes": 5,
+      "attempts": 20,
+      "wilson95": [
+        0.111862,
+        0.468701
+      ]
+    },
+    {
+      "model": "qwen3.6:27b",
+      "posture": "P2-off",
+      "successes": 0,
+      "attempts": 20,
+      "wilson95": [
+        0,
+        0.161125
+      ]
+    },
+    {
+      "model": "qwen3.6:27b",
+      "posture": "P2-on",
+      "successes": 0,
+      "attempts": 20,
+      "wilson95": [
+        0,
+        0.161125
+      ]
+    }
+  ]
+}
