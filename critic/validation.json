@@ -18,5 +18,6 @@
   "fresh_snapshot": "pass: make test, make demo, make recount, package checks",
   "visibility_change": false,
   "embedded_rego_syntax": "opa check passes",
-  "whitespace_check": "pass"
+  "whitespace_check": "pass",
+  "fresh_clone": "pass: make test, make demo, make recount and package checks on committed clone"
 }

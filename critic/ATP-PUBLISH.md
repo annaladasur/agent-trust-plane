@@ -22,3 +22,5 @@ Known source limitations: custom Python gateway is not the upstream agentgateway
 - This is a standalone extraction. No unrelated source-monorepository code, gold files or existing dirty work was modified. No task marked Done; independent CC-2 remains pending.
 
 Fresh staged Git snapshot: `make test`, `make demo`, `make recount` and package checks passed with blank AWS credentials. Inherited whitespace issues were normalized; `git diff --cached --check` and embedded ConfigMap `opa check` pass. The optional harness initially required PyYAML even for help; dependency loading is now delayed so help and opt-in refusal work in the dependency-free environment.
+
+Committed fresh clone (`git clone --no-local --branch demo/ATP-PUBLISH`): all four quickstart/package commands passed; 80 Rego tests, 10 Python tests and seven real policy examples. No source files changed during validation.
