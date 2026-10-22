@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.env
+*.key
+*.pem
+!*.pub
+.DS_Store
+output/
+cluster/.gitea.env
+results/runs-generated*.jsonl

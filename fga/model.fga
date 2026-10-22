@@ -1,0 +1,29 @@
+model
+  schema 1.1
+
+# Relationship model for the agent trust plane.
+# Agents never hold access themselves: every check is made for the developer the
+# agent acts for (AISVS 1.0 5.2.2, 9.5.2).
+
+type user
+
+type team
+  relations
+    define member: [user]
+
+type repo
+  relations
+    define owner: [team]
+    define writer: [user, team#member] or member from owner
+    define reader: [user, team#member] or writer
+
+type memory_namespace
+  relations
+    define repo: [repo]
+    define reader: reader from repo
+    define writer: writer from repo
+
+type document
+  relations
+    define repo: [repo]
+    define reader: reader from repo

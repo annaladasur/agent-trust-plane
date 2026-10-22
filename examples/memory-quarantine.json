@@ -1,0 +1,16 @@
+{
+  "task": {
+    "repo": "payments",
+    "tainted": true
+  },
+  "namespace": "repo:payments",
+  "sources": [
+    {
+      "trust": "trusted",
+      "ref": "test-fixture"
+    }
+  ],
+  "writer": {
+    "spiffe_id": "spiffe://example/triage"
+  }
+}

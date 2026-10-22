@@ -1,0 +1,22 @@
+{
+  "status": "pass",
+  "review_status": "Review",
+  "source_commit": "797acf7bb745b96e0c26afb439df830b90be7138",
+  "destination": "annaladasur/agent-trust-plane",
+  "opa_version": "1.14.1",
+  "python_version": "3.14.5",
+  "rego_tests_passed": 80,
+  "python_tests_passed": 10,
+  "policy_examples_passed": 7,
+  "saved_log_sha256": "f27ac58c46803f5f07da4f52e9f33340e02521092ddadc350b6b8067e3143dde",
+  "saved_log_matches_deck": true,
+  "yaml_files_syntax_checked": 19,
+  "markdown_links_and_python_syntax": "pass",
+  "credential_artifact_scan": "pass",
+  "lab_deployment_without_opt_in": "refused as expected",
+  "full_cluster_deployment": "not validated; experimental only",
+  "fresh_snapshot": "pass: make test, make demo, make recount, package checks",
+  "visibility_change": false,
+  "embedded_rego_syntax": "opa check passes",
+  "whitespace_check": "pass"
+}

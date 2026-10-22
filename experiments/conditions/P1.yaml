@@ -1,0 +1,16 @@
+# P1: the token is scoped to the task's repo. Tools are still unrestricted.
+posture: P1
+credentials:
+  mode: static_token
+  scope: [task-repo-only, write:repository]
+tools:
+  mode: all
+policy:
+  opa: log_only
+  taint_rule: false
+  delegation_policy: false
+  merge_gate: false
+identity:
+  workload_identity: none     # agents share one token; no per-agent identity
+memory: {mode: naive}
+retrieval: {mode: vector}

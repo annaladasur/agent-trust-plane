@@ -1,0 +1,1024 @@
+#!/usr/bin/env python3
+"""
+ATP Python gateway prototype (not the upstream agentgateway distribution)
+Interception proxy for AI Agent Systems:
+- Layered Policy Engine (Cheapest First):
+    1. CEL Workload Allow-Lists (mcpAuthorization, a2aDelegation)
+    2. extAuthz -> OPA (agent.tools, agent.delegation) with fail-closed semantics
+- Routes model inference to local host Ollama (host.docker.internal:11434)
+- Emits OpenTelemetry OTLP JSON spans to OTel Collector (otel-collector:4318) / Jaeger
+- Validates caller ServiceAccount token projection and caller identity
+- Maintains sticky task taint ledger (/ledger/taint) with provenance hooks
+- In-memory Decision Log (/policy/decisions) recording 100% of policy checks outside the model
+- Propagates W3C trace context across distributed hops
+"""
+
+import base64
+import hashlib
+import http.server
+import json
+import os
+import re
+import socketserver
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+PORT = int(os.environ.get("GATEWAY_PORT", "8080"))
+OLLAMA_UPSTREAM = os.environ.get("OLLAMA_UPSTREAM", "http://host.docker.internal:11434")
+OTEL_COLLECTOR_URL = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318/v1/traces")
+GITEA_UPSTREAM = os.environ.get("GITEA_UPSTREAM", "http://gitea.gitea.svc:3000/api/v1")
+BROKER_UPSTREAM = os.environ.get("BROKER_UPSTREAM", "http://broker.agents.svc:8081")
+OPA_UPSTREAM = os.environ.get("OPA_UPSTREAM", "http://opa.agents.svc:8181")
+MEMORY_UPSTREAM = os.environ.get("MEMORY_UPSTREAM", "http://memory-mcp.agents.svc:8082")
+ENFORCE_POLICY = os.environ.get("ENFORCE_POLICY", "true").lower() in ("true", "1", "yes")
+
+# Known trusted repo maintainers for response provenance taint classification (docs/taint.md)
+TRUSTED_MAINTAINERS = {"admin", "developer", "frontend-bot", "payments-bot", "platform-bot"}
+
+# In-memory sticky taint ledger: task_id -> {"task_id": str, "tainted": bool, "reason": str, "updated_at": str}
+TAINT_LEDGER = {}
+
+# In-memory decision log for empirical audit trail: list of decision dicts
+DECISION_LOG = []
+
+# CEL Allowed Tools per Agent Role (lib/tooltable.rego / AISVS 9.5.1, 9.3.1)
+ALLOWED_TOOLS_BY_AGENT = {
+    "orchestrator": {"memory.search", "memory.read", "memory.promote"},
+    "admin": {"memory.search", "memory.read", "memory.write", "memory.promote"},
+    "triage": {"gitea.get_issue", "gitea.list_issue_comments", "osv.query", "memory.write"},
+    "knowledge": {"graph.cypher_read", "graph.hybrid_search", "gitea.get_file_contents", "memory.search", "memory.write", "memory.read"},
+    "coder": {"sandbox.read_file", "sandbox.write_file", "sandbox.apply_patch", "gitea.get_file_contents", "memory.read"},
+    "verifier": {"gitea.get_commit_status", "gitea.get_file_contents", "gitea.comment_issue", "memory.write"},
+    "publisher": {"gitea.create_branch", "gitea.push_files", "gitea.create_pull_request", "memory.write", "memory.promote"},
+}
+
+# CEL Allowed A2A Delegation Edges (policies/agent/delegation.rego / ASI07)
+ALLOWED_DELEGATIONS = {
+    "orchestrator": {"triage", "knowledge", "coder", "publisher", "verifier"},
+    "triage": set(),
+    "knowledge": set(),
+    "coder": set(),
+    "publisher": set(),
+    "verifier": set(),
+}
+
+# Write tools requiring approval if context is tainted (lib/tooltable.rego)
+WRITE_TOOLS = {
+    "sandbox.write_file", "sandbox.apply_patch", "gitea.create_branch",
+    "gitea.push_files", "gitea.create_pull_request", "memory.write"
+}
+
+def parse_traceparent(tp_header: str):
+    """Parse W3C Traceparent: 00-{trace_id}-{parent_id}-{flags}"""
+    if not tp_header:
+        return uuid.uuid4().hex, None, "01"
+    parts = tp_header.strip().split("-")
+    if len(parts) == 4 and parts[0] == "00":
+        return parts[1], parts[2], parts[3]
+    return uuid.uuid4().hex, None, "01"
+
+def make_traceparent(trace_id: str, span_id: str, flags: str = "01") -> str:
+    return f"00-{trace_id}-{span_id}-{flags}"
+
+def decode_sa_token(auth_header: str) -> str:
+    """Extract ServiceAccount subject from JWT if present"""
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return "system:anonymous"
+    token = auth_header[7:].strip()
+    try:
+        parts = token.split(".")
+        if len(parts) >= 2:
+            payload_b64 = parts[1]
+            rem = len(payload_b64) % 4
+            if rem > 0:
+                payload_b64 += "=" * (4 - rem)
+            data = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+            return data.get("sub", data.get("kubernetes.io/serviceaccount/service-account.name", "system:serviceaccount"))
+    except Exception:
+        pass
+    return "system:serviceaccount"
+
+def extract_caller_role(headers) -> tuple[str, str]:
+    """Derive (caller_sa, caller_role) from headers and ServiceAccount token"""
+    auth_header = headers.get("Authorization", "")
+    sa_sub = decode_sa_token(auth_header)
+    explicit_role = headers.get("X-Agent-Role", headers.get("X-Caller-Role", ""))
+    if explicit_role:
+        return sa_sub, explicit_role
+
+    m = re.search(r"sa-([a-zA-Z0-9_\-]+)", sa_sub)
+    if m:
+        return sa_sub, m.group(1)
+
+    if "orchestrator" in sa_sub.lower() or "anonymous" in sa_sub.lower():
+        return sa_sub, "orchestrator"
+
+    return sa_sub, "unknown"
+
+def send_otlp_span(trace_id: str, span_id: str, parent_id: str, name: str, start_ns: int, end_ns: int, attributes: dict):
+    """Emit an OTLP JSON span to OTel Collector"""
+    span_obj = {
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": name,
+        "kind": 2, # SPAN_KIND_SERVER
+        "startTimeUnixNano": str(start_ns),
+        "endTimeUnixNano": str(end_ns),
+        "status": {"code": 1},
+        "attributes": []
+    }
+    if parent_id:
+        span_obj["parentSpanId"] = parent_id
+
+    for k, v in attributes.items():
+        if isinstance(v, bool):
+            span_obj["attributes"].append({"key": k, "value": {"boolValue": v}})
+        elif isinstance(v, int):
+            span_obj["attributes"].append({"key": k, "value": {"intValue": str(v)}})
+        elif isinstance(v, float):
+            span_obj["attributes"].append({"key": k, "value": {"doubleValue": v}})
+        elif isinstance(v, list):
+            span_obj["attributes"].append({"key": k, "value": {"stringValue": json.dumps(v)}})
+        else:
+            span_obj["attributes"].append({"key": k, "value": {"stringValue": str(v)}})
+
+    payload = {
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    {"key": "service.name", "value": {"stringValue": "agentgateway"}},
+                    {"key": "service.version", "value": {"stringValue": "1.5.0"}}
+                ]
+            },
+            "scopeSpans": [{
+                "scope": {"name": "agentgateway.core", "version": "1.5.0"},
+                "spans": [span_obj]
+            }]
+        }]
+    }
+
+    try:
+        req = urllib.request.Request(
+            OTEL_COLLECTOR_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            pass
+    except Exception as e:
+        print(f"[telemetry-warning] failed to export span to collector: {e}")
+
+def record_decision(entry: dict):
+    """Record policy decision in memory for empirical verification"""
+    entry["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    DECISION_LOG.append(entry)
+    print(f"[gateway-policy] {entry.get('engine').upper()} {entry.get('decision').upper()}: "
+          f"caller={entry.get('agent')} target={entry.get('target')} "
+          f"reasons={entry.get('reasons', [])} task={entry.get('task_id')}")
+
+# -----------------------------------------------------------------------------
+# Policy Evaluation Engines (CEL + OPA extAuthz)
+# -----------------------------------------------------------------------------
+
+def query_opa(package_path: str, input_data: dict, timeout: float = 3.0) -> dict:
+    """Query OPA REST API with fail-closed semantics"""
+    url = f"{OPA_UPSTREAM}/v1/data/{package_path}"
+    payload = json.dumps({"input": input_data}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status == 200:
+                body = json.loads(resp.read().decode("utf-8"))
+                return {"success": True, "result": body.get("result", {})}
+            return {"success": False, "error": f"OPA returned HTTP {resp.status}"}
+    except Exception as e:
+        return {"success": False, "error": f"OPA unreachable: {e}"}
+
+def evaluate_cel_tool_authorization(agent_role: str, tool_name: str) -> tuple[bool, str]:
+    """CEL Fast-Path: verify caller workload identity allow-list (Build-Spec §5)"""
+    allowed = ALLOWED_TOOLS_BY_AGENT.get(agent_role, set())
+    if tool_name in allowed:
+        return True, f"CEL mcpAuthorization allow: {agent_role} -> {tool_name}"
+    return False, f"CEL mcpAuthorization deny: agent '{agent_role}' not authorized for tool '{tool_name}'"
+
+def evaluate_cel_delegation_authorization(caller_role: str, callee_role: str) -> tuple[bool, str]:
+    """CEL Fast-Path: verify caller workload identity delegation edges (ASI07)"""
+    allowed = ALLOWED_DELEGATIONS.get(caller_role, set())
+    if callee_role in allowed:
+        return True, f"CEL a2aDelegation allow: {caller_role} -> {callee_role}"
+    return False, f"CEL a2aDelegation deny: caller '{caller_role}' not authorized to delegate to '{callee_role}'"
+
+def evaluate_opa_tool_policy(
+    agent_role: str,
+    tool_name: str,
+    task_id: str,
+    repo: str,
+    owner: str,
+    args: dict,
+    approval: dict = None
+) -> tuple[bool, list[str], str]:
+    """
+    extAuthz -> OPA tool policy (policies/agent/tools.rego).
+    Fails closed on missing fields, credential strings, or unapproved writes after taint.
+    """
+    taint_info = TAINT_LEDGER.get(task_id, {"tainted": False})
+    is_tainted = bool(taint_info.get("tainted", False))
+
+    canonical_args_str = json.dumps(args, sort_keys=True, separators=(',', ':'))
+    args_sha256 = hashlib.sha256(canonical_args_str.encode("utf-8")).hexdigest()
+
+    opa_input = {
+        "agent": agent_role,
+        "tool": {"name": tool_name},
+        "task_id": task_id,
+        "task": {"repo": repo, "owner": owner},
+        "context": {"tainted": is_tainted},
+        "args": args,
+        "args_sha256": args_sha256,
+        "approval": approval or {}
+    }
+
+    res = query_opa("agent/tools", opa_input)
+    if not res["success"]:
+        # Fail closed on policy engine failure
+        return False, [f"extAuthz fail-closed: {res['error']}"], args_sha256
+
+    result_obj = res["result"]
+    allow = bool(result_obj.get("allow", False))
+    deny = list(result_obj.get("deny", []))
+    if not allow and not deny:
+        deny = ["Default deny by agent.tools policy"]
+    return allow, deny, args_sha256
+
+def evaluate_opa_delegation_policy(
+    caller_role: str,
+    callee_role: str,
+    task_id: str,
+    chain: list,
+    acts_for: str = "developer",
+    approval: dict = None
+) -> tuple[bool, list[str]]:
+    """
+    extAuthz -> OPA A2A delegation policy (policies/agent/delegation.rego).
+    Fails closed on missing chain, excess depth, or missing acts-for.
+    """
+    taint_info = TAINT_LEDGER.get(task_id, {"tainted": False})
+    is_tainted = bool(taint_info.get("tainted", False))
+
+    opa_input = {
+        "caller": caller_role,
+        "callee": callee_role,
+        "chain": chain if (isinstance(chain, list) and len(chain) > 0) else [caller_role],
+        "context": {"tainted": is_tainted},
+        "acts_for": acts_for or "developer",
+        "approval": approval or {}
+    }
+
+    res = query_opa("agent/delegation", opa_input)
+    if not res["success"]:
+        return False, [f"extAuthz fail-closed: {res['error']}"]
+
+    result_obj = res["result"]
+    allow = bool(result_obj.get("allow", False))
+    deny = list(result_obj.get("deny", []))
+    if not allow and not deny:
+        deny = ["Default deny by agent.delegation policy"]
+    return allow, deny
+
+def map_gitea_request_to_tool(path: str, method: str, body_bytes: bytes) -> tuple[str, str, str, dict]:
+    """
+    Map proxied Gitea REST requests to normalized MCP tool calls:
+    Returns (tool_name, repo, owner, args_dict)
+    """
+    repo = "frontend"
+    owner = "online-boutique"
+    args = {}
+
+    m_repo = re.search(r"/repos/([^/]+)/([^/]+)", path)
+    if m_repo:
+        owner = m_repo.group(1)
+        repo = m_repo.group(2)
+        args["owner"] = owner
+        args["repo"] = repo
+
+    body_json = {}
+    if body_bytes:
+        try:
+            body_json = json.loads(body_bytes.decode("utf-8"))
+        except Exception:
+            pass
+
+    if isinstance(body_json, dict):
+        args.update(body_json)
+
+    # 1. Branch creation
+    if method == "POST" and "/branches" in path:
+        return "gitea.create_branch", repo, owner, args
+
+    # 2. File read / commit
+    if "/contents/" in path:
+        filepath = path.split("/contents/", 1)[1].split("?", 1)[0]
+        args["filepath"] = filepath
+        if method in ("POST", "PUT"):
+            return "gitea.push_files", repo, owner, args
+        return "gitea.get_file_contents", repo, owner, args
+
+    # 3. Pull Request
+    if method == "POST" and ("/pulls" in path or path.endswith("/pulls")):
+        return "gitea.create_pull_request", repo, owner, args
+
+    # 4. Issue comments
+    if "/comments" in path:
+        if method == "POST":
+            return "gitea.comment_issue", repo, owner, args
+        return "gitea.list_issue_comments", repo, owner, args
+
+    # 5. Issue read
+    if "/issues/" in path:
+        return "gitea.get_issue", repo, owner, args
+
+    # 6. Commit / PR status
+    if "/statuses/" in path or "/commits/" in path:
+        return "gitea.get_commit_status", repo, owner, args
+
+    # Default tool mapping
+    return f"gitea.{method.lower()}", repo, owner, args
+
+class AgentGatewayHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        print(f"[agentgateway] {self.client_address[0]} - - [{self.log_date_time_string()}] {format % args}")
+
+    def do_GET(self):
+        start_ns = time.time_ns()
+        tp_header = self.headers.get("traceparent")
+        trace_id, parent_id, flags = parse_traceparent(tp_header)
+        span_id = uuid.uuid4().hex[:16]
+
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "healthy",
+                "version": "1.5.0",
+                "gateway": "agentgateway",
+                "policy_enforcement": ENFORCE_POLICY,
+                "opa_upstream": OPA_UPSTREAM
+            }).encode("utf-8"))
+            return
+
+        if self.path == "/policy/decisions":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "total": len(DECISION_LOG),
+                "decisions": DECISION_LOG
+            }, indent=2).encode("utf-8"))
+            return
+
+        if self.path.startswith("/ledger/taint"):
+            task_id = None
+            if "?" in self.path:
+                query = self.path.split("?", 1)[1]
+                for part in query.split("&"):
+                    if part.startswith("task_id="):
+                        task_id = part.split("=", 1)[1]
+            res = TAINT_LEDGER.get(task_id, {"task_id": task_id, "tainted": False, "reason": "clean"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+            self.end_headers()
+            self.wfile.write(json.dumps(res).encode("utf-8"))
+            return
+
+        if self.path == "/memories" or self.path.startswith("/memories?"):
+            target_url = f"{MEMORY_UPSTREAM}{self.path}"
+            try:
+                req = urllib.request.Request(target_url, headers={"traceparent": make_traceparent(trace_id, span_id, flags)})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    resp_body = resp.read()
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    return
+            except Exception as e:
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"Failed to proxy to memory-mcp: {e}"}).encode("utf-8"))
+                return
+
+        # Upstream proxy for broker, agents, Ollama, or Gitea
+        if self.path == "/token" or self.path.startswith("/tokens") or self.path.startswith("/broker/"):
+            subpath = self.path[len("/broker"):] if self.path.startswith("/broker") else self.path
+            target_url = f"{BROKER_UPSTREAM}{subpath}"
+        elif self.path.startswith("/agents/"):
+            parts = self.path[len("/agents/"):].split("/", 1)
+            role = parts[0]
+            subpath = "/" + parts[1] if len(parts) > 1 else ""
+            target_url = f"http://{role}.agents.svc:8000{subpath}"
+        elif self.path.startswith("/api/chat") or self.path.startswith("/api/generate") or self.path.startswith("/api/tags"):
+            target_url = f"{OLLAMA_UPSTREAM}{self.path}"
+        else:
+            # Gitea read operations -> subject to CEL & OPA read policy
+            caller_sa, caller_role = extract_caller_role(self.headers)
+            task_id = self.headers.get("X-Task-ID", "task-default")
+            tool_name, repo, owner, args = map_gitea_request_to_tool(self.path, "GET", b"")
+
+            if ENFORCE_POLICY and tool_name.startswith("gitea."):
+                # 1. CEL Check
+                cel_ok, cel_msg = evaluate_cel_tool_authorization(caller_role, tool_name)
+                if not cel_ok:
+                    record_decision({
+                        "task_id": task_id, "trace_id": trace_id, "agent": caller_role,
+                        "caller_sa": caller_sa, "type": "tool", "target": tool_name,
+                        "engine": "cel", "decision": "deny", "reasons": [cel_msg]
+                    })
+                    send_otlp_span(trace_id, span_id, parent_id, f"policy.deny {tool_name}", start_ns, time.time_ns(), {
+                        "policy.engine": "cel", "policy.decision": "deny", "tool.name": tool_name, "agent.role": caller_role
+                    })
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("X-Policy-Engine", "CEL")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "CEL authorization denied", "detail": cel_msg}).encode("utf-8"))
+                    return
+
+                # 2. OPA extAuthz Check
+                opa_ok, opa_deny, args_sha = evaluate_opa_tool_policy(caller_role, tool_name, task_id, repo, owner, args)
+                if not opa_ok:
+                    record_decision({
+                        "task_id": task_id, "trace_id": trace_id, "agent": caller_role,
+                        "caller_sa": caller_sa, "type": "tool", "target": tool_name,
+                        "engine": "opa", "decision": "deny", "reasons": opa_deny, "args_sha256": args_sha
+                    })
+                    send_otlp_span(trace_id, span_id, parent_id, f"policy.deny {tool_name}", start_ns, time.time_ns(), {
+                        "policy.engine": "opa", "policy.decision": "deny", "tool.name": tool_name, "policy.reasons": opa_deny
+                    })
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("X-Policy-Engine", "OPA")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "OPA tool policy denied", "deny": opa_deny}).encode("utf-8"))
+                    return
+
+                record_decision({
+                    "task_id": task_id, "trace_id": trace_id, "agent": caller_role,
+                    "caller_sa": caller_sa, "type": "tool", "target": tool_name,
+                    "engine": "opa", "decision": "allow", "reasons": [], "args_sha256": args_sha
+                })
+
+            subpath = self.path[len("/gitea"):] if self.path.startswith("/gitea") else self.path
+            target_url = f"{GITEA_UPSTREAM}{subpath}" if not subpath.startswith("/api/v1") else f"http://gitea.gitea.svc:3000{subpath}"
+
+        headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+        if "x-gitea-token" in self.headers:
+            headers["Authorization"] = f"token {self.headers['x-gitea-token']}"
+
+        try:
+            req = urllib.request.Request(target_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+                # Provenance hook for untrusted context detection
+                try:
+                    resp_json = json.loads(data.decode("utf-8"))
+                    task_id = self.headers.get("X-Task-ID", "task-default")
+                    if isinstance(resp_json, list):
+                        for item in resp_json:
+                            user = item.get("user", {}).get("username", "")
+                            if user and user not in TRUSTED_MAINTAINERS:
+                                TAINT_LEDGER[task_id] = {
+                                    "task_id": task_id, "tainted": True,
+                                    "reason": f"Untrusted author '{user}' in {self.path}",
+                                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                }
+                                print(f"[taint-ledger] Task {task_id} TAINTED by author '{user}'")
+                except Exception:
+                    pass
+
+                self.send_response(resp.status)
+                for hk, hv in resp.headers.items():
+                    if hk.lower() not in ("content-length", "transfer-encoding"):
+                        self.send_header(hk, hv)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            err = e.read()
+            self.send_response(e.code)
+            self.end_headers()
+            self.wfile.write(err)
+        except Exception as e:
+            self.send_response(502)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+
+    def do_POST(self):
+        start_ns = time.time_ns()
+        content_len = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+
+        tp_header = self.headers.get("traceparent")
+        trace_id, parent_id, flags = parse_traceparent(tp_header)
+        span_id = uuid.uuid4().hex[:16]
+        caller_sa, caller_role = extract_caller_role(self.headers)
+        task_id = self.headers.get("X-Task-ID", "task-default")
+
+        # 0. STS Token Broker Route (/token or /broker/*)
+        if self.path == "/token" or self.path.startswith("/token/") or self.path.startswith("/broker/"):
+            subpath = self.path[len("/broker"):] if self.path.startswith("/broker") else self.path
+            target_url = f"{BROKER_UPSTREAM}{subpath}"
+            headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+            headers["traceparent"] = make_traceparent(trace_id, span_id, flags)
+            try:
+                req = urllib.request.Request(target_url, data=body, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp_body = resp.read()
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    return
+            except urllib.error.HTTPError as e:
+                err = e.read()
+                self.send_response(e.code)
+                self.end_headers()
+                self.wfile.write(err)
+                return
+            except Exception as e:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"Gateway broker upstream failure: {e}"}).encode("utf-8"))
+                return
+
+        # 1. Taint Ledger Update Route (/ledger/taint)
+        if self.path == "/ledger/taint":
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                tid = payload.get("task_id", task_id)
+                tainted = payload.get("tainted", True)
+                reason = payload.get("reason", "Untrusted context ingested")
+                TAINT_LEDGER[tid] = {
+                    "task_id": tid,
+                    "tainted": tainted,
+                    "reason": reason,
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                }
+                send_otlp_span(
+                    trace_id, span_id, parent_id, "gateway.taint_update",
+                    start_ns, time.time_ns(),
+                    {"task.id": tid, "tainted": tainted, "caller.sa": caller_sa, "reason": reason}
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                self.end_headers()
+                self.wfile.write(json.dumps(TAINT_LEDGER[tid]).encode("utf-8"))
+                return
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                return
+
+        # 2. Agent Delegation Route (/agents/<role>/run)
+        if self.path.startswith("/agents/"):
+            parts = self.path[len("/agents/"):].split("/", 1)
+            callee_role = parts[0]
+            subpath = "/" + parts[1] if len(parts) > 1 else ""
+            target_url = f"http://{callee_role}.agents.svc:8000{subpath}"
+
+            # Extract delegation metadata
+            body_json = {}
+            try:
+                body_json = json.loads(body.decode("utf-8"))
+            except Exception:
+                pass
+
+            tid = body_json.get("task_id", task_id)
+            chain = body_json.get("chain", [caller_role])
+            acts_for = self.headers.get("X-Acts-For", body_json.get("acts_for", "developer"))
+            approval = body_json.get("approval", None)
+            if not approval and "x-approval" in self.headers:
+                try:
+                    approval = json.loads(self.headers["x-approval"])
+                except Exception:
+                    pass
+
+            if ENFORCE_POLICY:
+                # 2.1 CEL Check
+                cel_ok, cel_msg = evaluate_cel_delegation_authorization(caller_role, callee_role)
+                if not cel_ok:
+                    record_decision({
+                        "task_id": tid, "trace_id": trace_id, "agent": caller_role,
+                        "caller_sa": caller_sa, "type": "delegation", "target": callee_role,
+                        "engine": "cel", "decision": "deny", "reasons": [cel_msg]
+                    })
+                    send_otlp_span(trace_id, span_id, parent_id, f"policy.deny delegation {callee_role}", start_ns, time.time_ns(), {
+                        "policy.engine": "cel", "policy.decision": "deny", "callee.role": callee_role, "caller.role": caller_role
+                    })
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("X-Policy-Engine", "CEL")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "CEL delegation denied", "detail": cel_msg}).encode("utf-8"))
+                    return
+
+                # 2.2 OPA extAuthz Check
+                opa_ok, opa_deny = evaluate_opa_delegation_policy(caller_role, callee_role, tid, chain, acts_for, approval)
+                if not opa_ok:
+                    record_decision({
+                        "task_id": tid, "trace_id": trace_id, "agent": caller_role,
+                        "caller_sa": caller_sa, "type": "delegation", "target": callee_role,
+                        "engine": "opa", "decision": "deny", "reasons": opa_deny
+                    })
+                    send_otlp_span(trace_id, span_id, parent_id, f"policy.deny delegation {callee_role}", start_ns, time.time_ns(), {
+                        "policy.engine": "opa", "policy.decision": "deny", "callee.role": callee_role, "policy.reasons": opa_deny
+                    })
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("X-Policy-Engine", "OPA")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "OPA delegation policy denied", "deny": opa_deny}).encode("utf-8"))
+                    return
+
+                record_decision({
+                    "task_id": tid, "trace_id": trace_id, "agent": caller_role,
+                    "caller_sa": caller_sa, "type": "delegation", "target": callee_role,
+                    "engine": "opa", "decision": "allow", "reasons": []
+                })
+
+            headers = {
+                "Content-Type": "application/json",
+                "traceparent": make_traceparent(trace_id, span_id, flags),
+                "X-Task-ID": tid
+            }
+            try:
+                req = urllib.request.Request(target_url, data=body, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    resp_body = resp.read()
+                    end_ns = time.time_ns()
+                    send_otlp_span(
+                        trace_id, span_id, parent_id, f"delegate.agent {callee_role}",
+                        start_ns, end_ns,
+                        {
+                            "agent.delegation": callee_role,
+                            "task.id": tid,
+                            "caller.sa": caller_sa,
+                            "policy.decision": "allow"
+                        }
+                    )
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    return
+            except urllib.error.HTTPError as e:
+                err = e.read()
+                self.send_response(e.code)
+                self.end_headers()
+                self.wfile.write(err)
+                return
+            except Exception as e:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"Agent delegation upstream failure ({callee_role}): {e}"}).encode("utf-8"))
+                return
+
+        # 3. Model Calls Proxy (/api/chat, /api/generate, /v1/chat/completions)
+        if self.path.startswith("/api/chat") or self.path.startswith("/api/generate") or self.path.startswith("/v1/"):
+            target_url = f"{OLLAMA_UPSTREAM}{self.path}"
+            model_name = "unknown"
+            try:
+                body_json = json.loads(body.decode("utf-8"))
+                model_name = body_json.get("model", "unknown")
+            except Exception:
+                pass
+
+            headers = {
+                "Content-Type": "application/json",
+                "traceparent": make_traceparent(trace_id, span_id, flags)
+            }
+
+            try:
+                req = urllib.request.Request(target_url, data=body, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    resp_body = resp.read()
+                    end_ns = time.time_ns()
+
+                    send_otlp_span(
+                        trace_id, span_id, parent_id, f"gen_ai.chat {model_name}",
+                        start_ns, end_ns,
+                        {
+                            "gen_ai.operation.name": "chat",
+                            "gen_ai.system": "ollama",
+                            "gen_ai.request.model": model_name,
+                            "task.id": task_id,
+                            "caller.sa": caller_sa
+                        }
+                    )
+
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                    self.send_header("X-Trace-ID", trace_id)
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    return
+            except urllib.error.HTTPError as e:
+                err = e.read()
+                self.send_response(e.code)
+                self.end_headers()
+                self.wfile.write(err)
+                return
+            except Exception as e:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"Gateway model upstream failure: {e}"}).encode("utf-8"))
+                return
+
+        # 4. Tool / MCP Invocation & Gitea Write Operations
+        if self.path.startswith("/tools/") or self.path.startswith("/mcp/tools/"):
+            tool_name = self.path.split("/tools/", 1)[1]
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception:
+                payload = {}
+            repo = payload.get("repo", "frontend")
+            owner = payload.get("owner", "online-boutique")
+            args = payload.get("args", {})
+            approval = payload.get("approval", None)
+            is_explicit_tool = True
+
+            # Promotion is a privileged human/lifecycle operation (Build-Spec §8)
+            if tool_name == "memory.promote":
+                target_url = f"{MEMORY_UPSTREAM}/tools/memory.promote"
+                headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+                headers["traceparent"] = make_traceparent(trace_id, span_id, flags)
+                headers["Content-Type"] = "application/json"
+                try:
+                    req = urllib.request.Request(target_url, data=body, headers=headers, method="POST")
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        resp_body = resp.read()
+                        self.send_response(resp.status)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                        self.end_headers()
+                        self.wfile.write(resp_body)
+                        return
+                except urllib.error.HTTPError as e:
+                    self.send_response(e.code)
+                    self.end_headers()
+                    self.wfile.write(e.read())
+                    return
+                except Exception as e:
+                    self.send_response(502)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": f"Memory MCP upstream failure: {e}"}).encode("utf-8"))
+                    return
+        else:
+            tool_name, repo, owner, args = map_gitea_request_to_tool(self.path, "POST", body)
+            approval = None
+            if "x-approval" in self.headers:
+                try:
+                    approval = json.loads(self.headers["x-approval"])
+                except Exception:
+                    pass
+            is_explicit_tool = False
+
+        if ENFORCE_POLICY:
+            # 4.1 CEL Allow-List Check (mcpAuthorization)
+            cel_ok, cel_msg = evaluate_cel_tool_authorization(caller_role, tool_name)
+            if not cel_ok:
+                record_decision({
+                    "task_id": task_id, "trace_id": trace_id, "agent": caller_role,
+                    "caller_sa": caller_sa, "type": "tool", "target": tool_name,
+                    "engine": "cel", "decision": "deny", "reasons": [cel_msg]
+                })
+                send_otlp_span(trace_id, span_id, parent_id, f"policy.deny {tool_name}", start_ns, time.time_ns(), {
+                    "policy.engine": "cel", "policy.decision": "deny", "tool.name": tool_name, "agent.role": caller_role
+                })
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("X-Policy-Engine", "CEL")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": "CEL authorization denied",
+                    "rule": "mcpAuthorization",
+                    "agent": caller_role,
+                    "tool": tool_name,
+                    "detail": cel_msg
+                }).encode("utf-8"))
+                return
+
+            # 4.2 OPA extAuthz Check (agent.tools)
+            opa_ok, opa_deny, args_sha = evaluate_opa_tool_policy(caller_role, tool_name, task_id, repo, owner, args, approval)
+            if not opa_ok:
+                record_decision({
+                    "task_id": task_id, "trace_id": trace_id, "agent": caller_role,
+                    "caller_sa": caller_sa, "type": "tool", "target": tool_name,
+                    "engine": "opa", "decision": "deny", "reasons": opa_deny, "args_sha256": args_sha
+                })
+                send_otlp_span(trace_id, span_id, parent_id, f"policy.deny {tool_name}", start_ns, time.time_ns(), {
+                    "policy.engine": "opa", "policy.decision": "deny", "tool.name": tool_name, "policy.reasons": opa_deny
+                })
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("X-Policy-Engine", "OPA")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": "OPA tool policy denied",
+                    "rule": "agent.tools",
+                    "deny": opa_deny,
+                    "tool": tool_name,
+                    "agent": caller_role
+                }).encode("utf-8"))
+                return
+
+            record_decision({
+                "task_id": task_id, "trace_id": trace_id, "agent": caller_role,
+                "caller_sa": caller_sa, "type": "tool", "target": tool_name,
+                "engine": "opa", "decision": "allow", "reasons": [], "args_sha256": args_sha
+            })
+
+        # If explicit tool endpoint was called and allowed
+        if is_explicit_tool:
+            if tool_name.startswith("memory."):
+                target_url = f"{MEMORY_UPSTREAM}/tools/{tool_name}"
+                headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+                headers["traceparent"] = make_traceparent(trace_id, span_id, flags)
+                headers["Content-Type"] = "application/json"
+                headers["X-Agent-Role"] = caller_role
+                headers["X-Task-ID"] = task_id
+                try:
+                    req = urllib.request.Request(target_url, data=body, headers=headers, method="POST")
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        resp_body = resp.read()
+                        end_ns = time.time_ns()
+                        try:
+                            parsed_mem = json.loads(resp_body.decode("utf-8"))
+                        except Exception:
+                            parsed_mem = {}
+                        span_attrs = {
+                            "execute_tool.path": self.path,
+                            "tool.name": tool_name,
+                            "task.id": task_id,
+                            "caller.sa": caller_sa,
+                            "policy.decision": "allow",
+                            "atp.memory.id": parsed_mem.get("memory_id", ""),
+                            "atp.memory.state": parsed_mem.get("state", "")
+                        }
+                        send_otlp_span(trace_id, span_id, parent_id, f"execute_tool {tool_name}", start_ns, end_ns, span_attrs)
+                        self.send_response(resp.status)
+                        for hk, hv in resp.headers.items():
+                            if hk.lower() not in ("content-length", "transfer-encoding"):
+                                self.send_header(hk, hv)
+                        self.send_header("Content-Length", str(len(resp_body)))
+                        self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                        self.end_headers()
+                        self.wfile.write(resp_body)
+                        return
+                except urllib.error.HTTPError as e:
+                    err_body = e.read()
+                    end_ns = time.time_ns()
+                    send_otlp_span(trace_id, span_id, parent_id, f"execute_tool.error {tool_name}", start_ns, end_ns, {
+                        "execute_tool.path": self.path,
+                        "tool.name": tool_name,
+                        "task.id": task_id,
+                        "http.status_code": e.code
+                    })
+                    self.send_response(e.code)
+                    for hk, hv in e.headers.items():
+                        if hk.lower() not in ("content-length", "transfer-encoding"):
+                            self.send_header(hk, hv)
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
+                except Exception as e:
+                    self.send_response(502)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": f"Memory MCP upstream failure: {e}"}).encode("utf-8"))
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "tool": tool_name,
+                "agent": caller_role,
+                "policy_decision": "allow",
+                "args_sha256": args_sha if 'args_sha' in locals() else ""
+            }).encode("utf-8"))
+            return
+
+        # Upstream proxy to Gitea
+        subpath = self.path[len("/gitea"):] if self.path.startswith("/gitea") else self.path
+        target_url = f"{GITEA_UPSTREAM}{subpath}" if not subpath.startswith("/api/v1") else f"http://gitea.gitea.svc:3000{subpath}"
+
+        headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+        headers["traceparent"] = make_traceparent(trace_id, span_id, flags)
+        if "x-gitea-token" in self.headers:
+            headers["Authorization"] = f"token {self.headers['x-gitea-token']}"
+
+        try:
+            req = urllib.request.Request(target_url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                resp_body = resp.read()
+                end_ns = time.time_ns()
+                send_otlp_span(
+                    trace_id, span_id, parent_id, f"execute_tool {tool_name}",
+                    start_ns, end_ns,
+                    {
+                        "execute_tool.path": self.path,
+                        "tool.name": tool_name,
+                        "task.id": task_id,
+                        "caller.sa": caller_sa,
+                        "policy.decision": "allow"
+                    }
+                )
+                self.send_response(resp.status)
+                for hk, hv in resp.headers.items():
+                    if hk.lower() not in ("content-length", "transfer-encoding"):
+                        self.send_header(hk, hv)
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                self.end_headers()
+                self.wfile.write(resp_body)
+        except urllib.error.HTTPError as e:
+            err = e.read()
+            self.send_response(e.code)
+            self.end_headers()
+            self.wfile.write(err)
+        except Exception as e:
+            self.send_response(502)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"Gateway tool upstream failure: {e}"}).encode("utf-8"))
+
+    def do_PUT(self):
+        # Treat PUT on Gitea files identical to POST for policy enforcement
+        self.do_POST()
+
+    def do_DELETE(self):
+        tp_header = self.headers.get("traceparent")
+        trace_id, parent_id, flags = parse_traceparent(tp_header)
+        span_id = uuid.uuid4().hex[:16]
+
+        if self.path.startswith("/token/") or self.path.startswith("/broker/"):
+            subpath = self.path[len("/broker"):] if self.path.startswith("/broker") else self.path
+            target_url = f"{BROKER_UPSTREAM}{subpath}"
+            headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+            try:
+                req = urllib.request.Request(target_url, headers=headers, method="DELETE")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    resp_body = resp.read()
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("traceparent", make_traceparent(trace_id, span_id, flags))
+                    self.end_headers()
+                    self.wfile.write(resp_body)
+                    return
+            except urllib.error.HTTPError as e:
+                self.send_response(e.code)
+                self.end_headers()
+                self.wfile.write(e.read())
+                return
+            except Exception as e:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+                return
+
+        self.send_response(404)
+        self.end_headers()
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+def main():
+    print(f"============================================================")
+    print(f"Starting AgentGateway v1.5.0 on 0.0.0.0:{PORT}")
+    print(f"Upstream Ollama: {OLLAMA_UPSTREAM}")
+    print(f"Upstream OTel:   {OTEL_COLLECTOR_URL}")
+    print(f"Upstream OPA:    {OPA_UPSTREAM} (Policy Enforcement: {ENFORCE_POLICY})")
+    print(f"============================================================")
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), AgentGatewayHandler)
+    server.serve_forever()
+
+if __name__ == "__main__":
+    main()

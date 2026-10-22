@@ -1,0 +1,362 @@
+[
+  {
+    "path": "LICENSE",
+    "source_sha256": "afaa6d4e8b1d8087a5d189ce315d9166c5a33220a7e793dc6b620095f3b357a1",
+    "release_sha256": "afaa6d4e8b1d8087a5d189ce315d9166c5a33220a7e793dc6b620095f3b357a1",
+    "modified": false
+  },
+  {
+    "path": "attest/__init__.py",
+    "source_sha256": "c576ce492b02412b2cbeff40f32855f65b58d4c26bc5d8aff21a313dee6d9499",
+    "release_sha256": "c576ce492b02412b2cbeff40f32855f65b58d4c26bc5d8aff21a313dee6d9499",
+    "modified": false
+  },
+  {
+    "path": "attest/build_statement.py",
+    "source_sha256": "9fe0a95521a41e99f9da9bf2a3ad4acd4bdcdba1ee884c64aee1d56d73c779f7",
+    "release_sha256": "9fe0a95521a41e99f9da9bf2a3ad4acd4bdcdba1ee884c64aee1d56d73c779f7",
+    "modified": false
+  },
+  {
+    "path": "attest/cosign.pub",
+    "source_sha256": "50c6ebf38adbd23c6567f7af118071e0171c3986faab779adfbb15c07bc2ba61",
+    "release_sha256": "50c6ebf38adbd23c6567f7af118071e0171c3986faab779adfbb15c07bc2ba61",
+    "modified": false
+  },
+  {
+    "path": "broker/__init__.py",
+    "source_sha256": "51199e3f3cdc1f62cae47e8ecdd342ceb5e7ca7922245c2e31ddf4c9bbc43e0a",
+    "release_sha256": "51199e3f3cdc1f62cae47e8ecdd342ceb5e7ca7922245c2e31ddf4c9bbc43e0a",
+    "modified": false
+  },
+  {
+    "path": "broker/broker.py",
+    "source_sha256": "118e0ae1af79574a71f7e72de9d93111c6119de17235f770d8fa94da53a8b6cc",
+    "release_sha256": "118e0ae1af79574a71f7e72de9d93111c6119de17235f770d8fa94da53a8b6cc",
+    "modified": false
+  },
+  {
+    "path": "broker/test_broker.py",
+    "source_sha256": "8efe7a670462eed48e94e20a6c05daa4f3537fae4334b4806d456b96e51b6afe",
+    "release_sha256": "8efe7a670462eed48e94e20a6c05daa4f3537fae4334b4806d456b96e51b6afe",
+    "modified": false
+  },
+  {
+    "path": "cluster/agent_runner.py",
+    "source_sha256": "8c8e4ba82c28e6a6b1a8f7cfe010782d7f1ce9a8706f4df0cc456353169c1485",
+    "release_sha256": "8c8e4ba82c28e6a6b1a8f7cfe010782d7f1ce9a8706f4df0cc456353169c1485",
+    "modified": false
+  },
+  {
+    "path": "cluster/agentgateway.py",
+    "source_sha256": "be4e3b271e307a603150897b71e2ddf63e70c2dccf63d6741fc1b2fcd1b91876",
+    "release_sha256": "f81eecb9ba9c1257563dce189233f2f0ad7e441ef1aba7bfd782c0cd824410c4",
+    "modified": true
+  },
+  {
+    "path": "cluster/agentgateway.yaml",
+    "source_sha256": "af6e320515218426dcbb5e197f461042bfba9866a2bbb56b7946c7cacabab811",
+    "release_sha256": "9421b92562f7e1142761192b72adf509328bff53f204493a88e0f218196e3c22",
+    "modified": true
+  },
+  {
+    "path": "cluster/agents.yaml",
+    "source_sha256": "8d46fc2adbff045d9ca79aef044c181081fefdca8979dce0bf8c332562a4f826",
+    "release_sha256": "8d46fc2adbff045d9ca79aef044c181081fefdca8979dce0bf8c332562a4f826",
+    "modified": false
+  },
+  {
+    "path": "cluster/bootstrap_gitea.sh",
+    "source_sha256": "ed4f83e451ca549943a767450ca0160889fba206b484420208eb78dcfef6aa5b",
+    "release_sha256": "ed4f83e451ca549943a767450ca0160889fba206b484420208eb78dcfef6aa5b",
+    "modified": false
+  },
+  {
+    "path": "cluster/broker.py",
+    "source_sha256": "118e0ae1af79574a71f7e72de9d93111c6119de17235f770d8fa94da53a8b6cc",
+    "release_sha256": "118e0ae1af79574a71f7e72de9d93111c6119de17235f770d8fa94da53a8b6cc",
+    "modified": false
+  },
+  {
+    "path": "cluster/broker.yaml",
+    "source_sha256": "e373c24e761aa6060cf14d47cafc30cd81128c6a3e2aefa1b51efb5f8168250a",
+    "release_sha256": "e373c24e761aa6060cf14d47cafc30cd81128c6a3e2aefa1b51efb5f8168250a",
+    "modified": false
+  },
+  {
+    "path": "cluster/configure_branch_protection.py",
+    "source_sha256": "914ce49ed572cb5b02148a745dfd765c01e1d39b8df935f59507894ec6285e9e",
+    "release_sha256": "914ce49ed572cb5b02148a745dfd765c01e1d39b8df935f59507894ec6285e9e",
+    "modified": false
+  },
+  {
+    "path": "cluster/gen_gitea_env.sh",
+    "source_sha256": "2a832b6aa3b0db29a8637929bc1f1f81986b8944c22e7ec91f15b0203743c1b2",
+    "release_sha256": "2a832b6aa3b0db29a8637929bc1f1f81986b8944c22e7ec91f15b0203743c1b2",
+    "modified": false
+  },
+  {
+    "path": "cluster/gitea.yaml",
+    "source_sha256": "8d2ea2b98414e6082fe02a9f40b34a83f084d102b29346bee680a1a79960b7b3",
+    "release_sha256": "8d2ea2b98414e6082fe02a9f40b34a83f084d102b29346bee680a1a79960b7b3",
+    "modified": false
+  },
+  {
+    "path": "cluster/gitea_auth.py",
+    "source_sha256": "1551b76ac08e8ecc1acdfc726a0ae8f1d282a9d229d2422584da19d8fd6c66d4",
+    "release_sha256": "1551b76ac08e8ecc1acdfc726a0ae8f1d282a9d229d2422584da19d8fd6c66d4",
+    "modified": false
+  },
+  {
+    "path": "cluster/kind.yaml",
+    "source_sha256": "0c92862495eb0fd833f1d10d7181f6913cf731cc7f7ddd465358af65de901b58",
+    "release_sha256": "0c92862495eb0fd833f1d10d7181f6913cf731cc7f7ddd465358af65de901b58",
+    "modified": false
+  },
+  {
+    "path": "cluster/memory.yaml",
+    "source_sha256": "17e00d88c9ff8787a17117908e4163332d0c1b96f2f595cf9534bccfb591bd33",
+    "release_sha256": "17e00d88c9ff8787a17117908e4163332d0c1b96f2f595cf9534bccfb591bd33",
+    "modified": false
+  },
+  {
+    "path": "cluster/memory_server.py",
+    "source_sha256": "0bcadd02e1bdd9d28b39510e354cf2e3947df787255947560af27808590719ff",
+    "release_sha256": "0bcadd02e1bdd9d28b39510e354cf2e3947df787255947560af27808590719ff",
+    "modified": false
+  },
+  {
+    "path": "cluster/merge_gate.py",
+    "source_sha256": "5aa09285ad34edbe5b20e6fd219eb2081e931b83e1535f234fe75e0ed9879c24",
+    "release_sha256": "5aa09285ad34edbe5b20e6fd219eb2081e931b83e1535f234fe75e0ed9879c24",
+    "modified": false
+  },
+  {
+    "path": "cluster/monitoring.yaml",
+    "source_sha256": "291b2d6a27bac2702ddcf3a13c3df1546bf542a57f0c84b83e808a4723d4ba7e",
+    "release_sha256": "291b2d6a27bac2702ddcf3a13c3df1546bf542a57f0c84b83e808a4723d4ba7e",
+    "modified": false
+  },
+  {
+    "path": "cluster/networkpolicies.yaml",
+    "source_sha256": "4dc6a651e63982f390175483f52a06d8e255b6c5fbe786e3d964d6d6c85eeb95",
+    "release_sha256": "8d4a0902cc9221085b4344da28af1870a34005a9d07891a8b63e61a01f692c79",
+    "modified": true
+  },
+  {
+    "path": "cluster/opa.yaml",
+    "source_sha256": "d23b7a2182a2835287bed38f7e3ef6b495c6b68e7b1136a715d1004686697156",
+    "release_sha256": "5b24a13d366f26e8acf066943986f696438c039a94d85891a921914f971986c4",
+    "modified": true
+  },
+  {
+    "path": "cluster/postgres.yaml",
+    "source_sha256": "e7674a95cbe16f9dd186154012fac2a373e424f6e2a690d6f50573c888b1d701",
+    "release_sha256": "e7674a95cbe16f9dd186154012fac2a373e424f6e2a690d6f50573c888b1d701",
+    "modified": false
+  },
+  {
+    "path": "cluster/rotate_gitea_passwords.sh",
+    "source_sha256": "d48a62e6849a0bb7f23367eebcbd6b9d97bb4f947f830faaa0aab2b5316258ec",
+    "release_sha256": "d48a62e6849a0bb7f23367eebcbd6b9d97bb4f947f830faaa0aab2b5316258ec",
+    "modified": false
+  },
+  {
+    "path": "cluster/run_cve_task.py",
+    "source_sha256": "38a4f4d25421173aa0a38964a321de0deabee79002cfbd2c4eacbc6e4a92bd30",
+    "release_sha256": "38a4f4d25421173aa0a38964a321de0deabee79002cfbd2c4eacbc6e4a92bd30",
+    "modified": false
+  },
+  {
+    "path": "cluster/scan_cves.py",
+    "source_sha256": "ee4c02e9d14f674cf625eef43bbfde6c044016507af91da19df8d5af78b102b3",
+    "release_sha256": "ee4c02e9d14f674cf625eef43bbfde6c044016507af91da19df8d5af78b102b3",
+    "modified": false
+  },
+  {
+    "path": "cluster/seed_repos.py",
+    "source_sha256": "356c7117c9f09d4325f93c8be270c0f1d9d70fa15871721c1ee10d485eb678cd",
+    "release_sha256": "356c7117c9f09d4325f93c8be270c0f1d9d70fa15871721c1ee10d485eb678cd",
+    "modified": false
+  },
+  {
+    "path": "cluster/verify_gateway_policy.py",
+    "source_sha256": "4c3401eefdd75b9ff8a60955d739319d6dd7ae3dab43ffa798f16b3101e4eac9",
+    "release_sha256": "4c3401eefdd75b9ff8a60955d739319d6dd7ae3dab43ffa798f16b3101e4eac9",
+    "modified": false
+  },
+  {
+    "path": "cluster/verify_isolation.py",
+    "source_sha256": "d81bfb46d45f8a83f61396eb4b6b7bac6e6165f9eaf25fb80c32d8d6ef6b16b4",
+    "release_sha256": "224c7dddf19caca5d115524595307c7b26e912fb307a5d7b76cc5cbdd26c3759",
+    "modified": true
+  },
+  {
+    "path": "cluster/verify_memory_plane.py",
+    "source_sha256": "d6cd08f62cfc19c1809f3481645f0c6b4da586444f917a0fefae4fbd50440413",
+    "release_sha256": "d6cd08f62cfc19c1809f3481645f0c6b4da586444f917a0fefae4fbd50440413",
+    "modified": false
+  },
+  {
+    "path": "cluster/verify_merge_gate.py",
+    "source_sha256": "e3c801bb947f00afa516d27385685a71acf8b986ee7d3ec47cbaed219beb5cd7",
+    "release_sha256": "e3c801bb947f00afa516d27385685a71acf8b986ee7d3ec47cbaed219beb5cd7",
+    "modified": false
+  },
+  {
+    "path": "cosign.pub",
+    "source_sha256": "50c6ebf38adbd23c6567f7af118071e0171c3986faab779adfbb15c07bc2ba61",
+    "release_sha256": "50c6ebf38adbd23c6567f7af118071e0171c3986faab779adfbb15c07bc2ba61",
+    "modified": false
+  },
+  {
+    "path": "evals/PREREGISTRATION.md",
+    "source_sha256": "966b19fb99338fc7acae76b9ebab29159c90d78059eb3e851ee87116ef09af78",
+    "release_sha256": "56b26137dd96742be3c5cbe3efc99d5101411d69a0d9cb10c89c8651890b7eb0",
+    "modified": true
+  },
+  {
+    "path": "evals/attacks/examples/dependency-001.yaml",
+    "source_sha256": "c2b92c3775e132de73d55a08961363a9e9240731e2c6ce4412e98bc2754ad832",
+    "release_sha256": "c2b92c3775e132de73d55a08961363a9e9240731e2c6ce4412e98bc2754ad832",
+    "modified": false
+  },
+  {
+    "path": "evals/attacks/examples/exfil-001.yaml",
+    "source_sha256": "dd1e02d41ed00d102967e053acdedf537229dc1b1709799a6a3085f83e4862c4",
+    "release_sha256": "dd1e02d41ed00d102967e053acdedf537229dc1b1709799a6a3085f83e4862c4",
+    "modified": false
+  },
+  {
+    "path": "evals/attacks/manifest.yaml",
+    "source_sha256": "33aa0a58d0ad0688c42b6b90bda898ce2b289fb4475db68659dae4273b8fd196",
+    "release_sha256": "33aa0a58d0ad0688c42b6b90bda898ce2b289fb4475db68659dae4273b8fd196",
+    "modified": false
+  },
+  {
+    "path": "experiments/conditions/P0.yaml",
+    "source_sha256": "5ae3bbb4e37d7905d26d61b453335e8126ecc1cd92fffe5e6c3e37cc1a6a6c21",
+    "release_sha256": "5ae3bbb4e37d7905d26d61b453335e8126ecc1cd92fffe5e6c3e37cc1a6a6c21",
+    "modified": false
+  },
+  {
+    "path": "experiments/conditions/P1.yaml",
+    "source_sha256": "542688b236db2327dfa1871cfbfd5613058455513be04ac465ec089da5baba58",
+    "release_sha256": "542688b236db2327dfa1871cfbfd5613058455513be04ac465ec089da5baba58",
+    "modified": false
+  },
+  {
+    "path": "experiments/conditions/P2-off.yaml",
+    "source_sha256": "602c58391bfc00cecb0686bda2c1aa1ad9cff8bc3c348152763c95702318ed4c",
+    "release_sha256": "602c58391bfc00cecb0686bda2c1aa1ad9cff8bc3c348152763c95702318ed4c",
+    "modified": false
+  },
+  {
+    "path": "experiments/conditions/P2-on.yaml",
+    "source_sha256": "e6a719c458d78a3342da1086e19b130a4e8ace1e354507a7641e6cc4fbeadbdf",
+    "release_sha256": "e6a719c458d78a3342da1086e19b130a4e8ace1e354507a7641e6cc4fbeadbdf",
+    "modified": false
+  },
+  {
+    "path": "experiments/exp2/P0.yaml",
+    "source_sha256": "e08e7deadba0db9884fe9da2004d9a36e495d67ee0ac72b307091240911fcbee",
+    "release_sha256": "e08e7deadba0db9884fe9da2004d9a36e495d67ee0ac72b307091240911fcbee",
+    "modified": false
+  },
+  {
+    "path": "experiments/exp2/P1.yaml",
+    "source_sha256": "5b02304c33838dd8d81cc66c2c3900fe4ef5b5ab966c93519aa423dbfcb2f925",
+    "release_sha256": "5b02304c33838dd8d81cc66c2c3900fe4ef5b5ab966c93519aa423dbfcb2f925",
+    "modified": false
+  },
+  {
+    "path": "experiments/exp2/P2-off.yaml",
+    "source_sha256": "e5e246a8fe346fd6914b5606991e2d73efa950cf7602de9cd97232d19f6e9667",
+    "release_sha256": "e5e246a8fe346fd6914b5606991e2d73efa950cf7602de9cd97232d19f6e9667",
+    "modified": false
+  },
+  {
+    "path": "experiments/exp2/P2-on.yaml",
+    "source_sha256": "77a1e4bf016e730bcd7498fae66679d4252500da613d2bed80dad7d43e12d16c",
+    "release_sha256": "77a1e4bf016e730bcd7498fae66679d4252500da613d2bed80dad7d43e12d16c",
+    "modified": false
+  },
+  {
+    "path": "experiments/exp2/run_matrix.py",
+    "source_sha256": "00d534a6535e8efbc4505497f13912e0cb831807637a98f205230ea3fe75073b",
+    "release_sha256": "e6e269e748fcf22e632391ea4a7ee0b9845f6bdc6c2e77ae63e75eaf8b822c2d",
+    "modified": true
+  },
+  {
+    "path": "fga/model.fga",
+    "source_sha256": "bcc9be54dad10a5e93b1221a1bd60867a6bcfd9db3c1f664a1346b82bbe65ff7",
+    "release_sha256": "bcc9be54dad10a5e93b1221a1bd60867a6bcfd9db3c1f664a1346b82bbe65ff7",
+    "modified": false
+  },
+  {
+    "path": "fga/model_test.fga.yaml",
+    "source_sha256": "9d9ff2ce7e06e999a32db709a35c35fbae0e762450e4596be03992f4d450a3f6",
+    "release_sha256": "9d9ff2ce7e06e999a32db709a35c35fbae0e762450e4596be03992f4d450a3f6",
+    "modified": false
+  },
+  {
+    "path": "policies/agent/delegation.rego",
+    "source_sha256": "a338b20c08b4f2c00cda1745b6892d849c8d01ea0cc6a19aff6541dcdb2290fe",
+    "release_sha256": "a338b20c08b4f2c00cda1745b6892d849c8d01ea0cc6a19aff6541dcdb2290fe",
+    "modified": false
+  },
+  {
+    "path": "policies/agent/delegation_test.rego",
+    "source_sha256": "15c08c7e01b039fcf35f28f8dc8d0bba8b2ab1b29f701d48c2db2fdfdec47408",
+    "release_sha256": "15c08c7e01b039fcf35f28f8dc8d0bba8b2ab1b29f701d48c2db2fdfdec47408",
+    "modified": false
+  },
+  {
+    "path": "policies/agent/memory.rego",
+    "source_sha256": "6036ff7889991e06d4588774ce05dafce3c3f09fa5a9a38f90dd44f2a2fe0cf3",
+    "release_sha256": "4fed00740e899adcc35d21a68df6becf3ed4417c86025ac4a146e78c7d8e263f",
+    "modified": true
+  },
+  {
+    "path": "policies/agent/memory_test.rego",
+    "source_sha256": "32610756134ef5d8933f89d70b15d8bfbec05ee6df7f0c84096b9384e4ea6ba1",
+    "release_sha256": "32610756134ef5d8933f89d70b15d8bfbec05ee6df7f0c84096b9384e4ea6ba1",
+    "modified": false
+  },
+  {
+    "path": "policies/agent/tools.rego",
+    "source_sha256": "24a3139588377155c9830e07a83a4d110d49490e3fc4f2ee0444c8de8902d2ff",
+    "release_sha256": "24a3139588377155c9830e07a83a4d110d49490e3fc4f2ee0444c8de8902d2ff",
+    "modified": false
+  },
+  {
+    "path": "policies/agent/tools_test.rego",
+    "source_sha256": "3dcc8c9cd8a5ba83bf0cd45d1b43fab2b7a2bb65a96ff190da337699130e93aa",
+    "release_sha256": "3dcc8c9cd8a5ba83bf0cd45d1b43fab2b7a2bb65a96ff190da337699130e93aa",
+    "modified": false
+  },
+  {
+    "path": "policies/lib/tooltable.rego",
+    "source_sha256": "d390d7f46b350517ae067d50239097d6bc28d0e155932c47d0f6f6b747692bb5",
+    "release_sha256": "d390d7f46b350517ae067d50239097d6bc28d0e155932c47d0f6f6b747692bb5",
+    "modified": false
+  },
+  {
+    "path": "policies/merge/attestation.rego",
+    "source_sha256": "96691d07f89f2312fa34b62945f37a7e08fccb598414dfeab174b816e5e313f1",
+    "release_sha256": "96691d07f89f2312fa34b62945f37a7e08fccb598414dfeab174b816e5e313f1",
+    "modified": false
+  },
+  {
+    "path": "policies/merge/attestation_test.rego",
+    "source_sha256": "fdd495d88d55ddef4bb92d30c1c69352e7763f412241dcd01127da2a830513f6",
+    "release_sha256": "b06e3949544e33015e616a6593c39773a45c487c25be802d80fbd15dc933a271",
+    "modified": true
+  },
+  {
+    "path": "results/runs.jsonl",
+    "source_sha256": "f27ac58c46803f5f07da4f52e9f33340e02521092ddadc350b6b8067e3143dde",
+    "release_sha256": "f27ac58c46803f5f07da4f52e9f33340e02521092ddadc350b6b8067e3143dde",
+    "modified": false
+  }
+]
